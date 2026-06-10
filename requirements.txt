@@ -1,16 +1,33 @@
+# veRL 0.8.0 development/runtime baseline
 accelerate
 codetiming
 datasets
 dill
-flash-attn
 hydra-core
-numpy
+liger-kernel
+numpy<2.0.0
 pandas
+peft
+pyarrow>=19.0.0
 pybind11
-ray
-tensordict<0.6
-transformers<4.48
-vllm<=0.6.3
+pylatexenc
+ray[default]
+tensordict>=0.8.0,<=0.10.0,!=0.9.0
+torchdata
+transformers>=4.57.0
 wandb
-IPython
-matplotlib
+packaging>=20.0
+tensorboard
+TransferQueue==0.1.7
+
+# Qwen3-VL / multimodal rollout
+qwen-vl-utils
+pillow
+vllm>=0.11.0
+
+# Search-R1 retrieval services
+fastapi
+uvicorn
+requests
+sentence-transformers
+faiss-cpu

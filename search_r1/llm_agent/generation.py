@@ -2,6 +2,7 @@ import torch
 import re
 from collections import defaultdict
 import os
+import numpy as np
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
@@ -20,7 +21,9 @@ class GenerationConfig:
     num_gpus: int
     no_think_rl: bool=False
     search_url: str = None
+    vision_search_url: str = None
     topk: int = 3
+    image_key: str = "images"
 
 class LLMGenerationManager:
     def __init__(
@@ -41,6 +44,7 @@ class LLMGenerationManager:
             max_obs_length=config.max_obs_length,
             max_start_length=config.max_start_length
         ))
+        self.sequence_keys = {'input_ids', 'attention_mask', 'position_ids'}
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
@@ -51,6 +55,14 @@ class LLMGenerationManager:
             padding="longest"
         )['input_ids']
 
+    def _truncate_to_first_action(self, response: str) -> str:
+        """Keep text through the first complete tool/answer tag."""
+        pattern = r'<(search|vision_search|answer)>(.*?)</\1>'
+        match = re.search(pattern, response, re.DOTALL)
+        if match:
+            return response[:match.end()]
+        return response
+
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
         """Process responses to stop at search operation or answer operation."""
         responses_str = self.tokenizer.batch_decode(
@@ -58,12 +70,7 @@ class LLMGenerationManager:
             skip_special_tokens=True
         )
 
-        responses_str = [resp.split('</search>')[0] + '</search>'
-                 if '</search>' in resp 
-                 else resp.split('</answer>')[0] + '</answer>'
-                 if '</answer>' in resp 
-                 else resp
-                 for resp in responses_str]
+        responses_str = [self._truncate_to_first_action(resp) for resp in responses_str]
 
         if self.config.no_think_rl:
             raise ValueError('stop')
@@ -91,7 +98,7 @@ class LLMGenerationManager:
         return next_obs_ids
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
-                            next_obs_ids: torch.Tensor) -> Dict:
+                            next_obs_ids: torch.Tensor) -> DataProto:
         """Update rolling state with new responses and observations."""
         # Concatenate and handle padding        
         new_input_ids = self.tensor_fn.concatenate_with_padding([
@@ -108,14 +115,30 @@ class LLMGenerationManager:
         effective_len = new_attention_mask.sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
 
-        new_rollings = DataProto.from_dict({
-            'input_ids': new_input_ids[:, -max_len:],
-            'position_ids': new_position_ids[:, -max_len:],
-            'attention_mask': new_attention_mask[:, -max_len:]
-        })
+        preserved_tensors = {k: v for k, v in rollings.batch.items() if k not in self.sequence_keys}
+        rolling_tensors = {
+                'input_ids': new_input_ids[:, -max_len:],
+                'position_ids': new_position_ids[:, -max_len:],
+                'attention_mask': new_attention_mask[:, -max_len:]
+        }
+        rolling_tensors.update(preserved_tensors)
+        new_rollings = DataProto.from_dict(
+            rolling_tensors,
+            non_tensors=rollings.non_tensor_batch,
+        )
         new_rollings.meta_info.update(rollings.meta_info)
         
         return new_rollings
+
+    def _slice_active_batch(self, batch: DataProto, active_mask: torch.Tensor) -> DataProto:
+        """Slice tensor and non-tensor fields to active examples."""
+        mask_np = active_mask.detach().cpu().numpy()
+        active_batch = DataProto.from_dict(
+            tensors={k: v[active_mask] for k, v in batch.batch.items()},
+            non_tensors={k: v[mask_np] for k, v in batch.non_tensor_batch.items()},
+        )
+        active_batch.meta_info.update(batch.meta_info)
+        return active_batch
 
     def _info_masked_concatenate_with_padding(self, 
                 prompt: torch.Tensor, 
@@ -181,7 +204,8 @@ class LLMGenerationManager:
         remainder = batch_size % num_gpus
         
         for key in active_batch.batch.keys():
-            active_batch.batch[key] = active_batch.batch[key].long()
+            if not torch.is_floating_point(active_batch.batch[key]):
+                active_batch.batch[key] = active_batch.batch[key].long()
         if remainder == 0:
             return self.actor_rollout_wg.generate_sequences(active_batch)
         
@@ -194,15 +218,22 @@ class LLMGenerationManager:
             pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
             padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
 
-        padded_active_batch = DataProto.from_dict(padded_batch)
+        padded_non_tensors = {}
+        for k, v in active_batch.non_tensor_batch.items():
+            pad_values = np.repeat(v[0:1], padding_size, axis=0)
+            padded_non_tensors[k] = np.concatenate([v, pad_values], axis=0)
+
+        padded_active_batch = DataProto.from_dict(padded_batch, non_tensors=padded_non_tensors)
         for key in padded_active_batch.batch.keys():
-            padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
+            if not torch.is_floating_point(padded_active_batch.batch[key]):
+                padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
 
         # Generate with padded batch
         padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
 
         # Remove padding from output
         trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
+        trimmed_non_tensors = {k: v[:-padding_size] for k, v in padded_output.non_tensor_batch.items()}
         
         # Handle meta_info if present
         if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
@@ -215,6 +246,7 @@ class LLMGenerationManager:
             padded_output.meta_info = trimmed_meta
             
         padded_output.batch = trimmed_batch
+        padded_output.non_tensor_batch = trimmed_non_tensors
         return padded_output
 
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
@@ -227,6 +259,7 @@ class LLMGenerationManager:
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        valid_vision_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -240,9 +273,7 @@ class LLMGenerationManager:
             )
             
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            rollings_active = self._slice_active_batch(rollings, active_mask)
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
@@ -250,8 +281,11 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask
+            next_obs, dones, valid_action, is_search, is_vision_search = self.execute_predictions(
+                responses_str,
+                self.tokenizer.pad_token,
+                active_mask,
+                image_batches=rollings.non_tensor_batch.get(self.config.image_key),
             )
             
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
@@ -260,6 +294,7 @@ class LLMGenerationManager:
             turns_stats[curr_active_mask] += 1
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            valid_vision_search_stats += torch.tensor(is_vision_search, dtype=torch.int)
 
             next_obs_ids = self._process_next_obs(next_obs)
             
@@ -283,9 +318,7 @@ class LLMGenerationManager:
             )
 
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            rollings_active = self._slice_active_batch(rollings, active_mask)
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
@@ -293,8 +326,12 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=False
+            _, dones, valid_action, is_search, is_vision_search = self.execute_predictions(
+                responses_str,
+                self.tokenizer.pad_token,
+                active_mask,
+                do_search=False,
+                image_batches=rollings.non_tensor_batch.get(self.config.image_key),
             )
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
@@ -302,6 +339,7 @@ class LLMGenerationManager:
             active_num_list.append(active_mask.sum().item())
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            valid_vision_search_stats += torch.tensor(is_vision_search, dtype=torch.int)
             
 
             original_right_side = self._update_right_side(
@@ -313,14 +351,23 @@ class LLMGenerationManager:
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
+        meta_info['valid_vision_search_stats'] = valid_vision_search_stats.tolist()
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+        return self._compose_final_output(
+            original_left_side,
+            original_right_side,
+            meta_info,
+            gen_batch.non_tensor_batch,
+            {k: v for k, v in gen_batch.batch.items() if k not in self.sequence_keys},
+        )
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
-                            meta_info: Dict) -> Tuple[Dict, Dict]:
+                            meta_info: Dict,
+                            non_tensor_batch: Dict = None,
+                            preserved_tensors: Dict[str, torch.Tensor] = None) -> DataProto:
         """Compose final generation output."""
         final_output = right_side.copy()
         final_output['prompts'] = left_side['input_ids']
@@ -344,13 +391,22 @@ class LLMGenerationManager:
         final_output['position_ids'] = self.tensor_fn.create_position_ids(
             final_output['attention_mask']
         )
+        if preserved_tensors:
+            final_output.update(preserved_tensors)
         
-        final_output = DataProto.from_dict(final_output)
+        final_output = DataProto.from_dict(final_output, non_tensors=non_tensor_batch)
         final_output.meta_info.update(meta_info)
         
         return final_output
 
-    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
+    def execute_predictions(
+        self,
+        predictions: List[str],
+        pad_token: str,
+        active_mask=None,
+        do_search=True,
+        image_batches=None,
+    ) -> List[str]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -364,47 +420,87 @@ class LLMGenerationManager:
         Returns:
             List of observation strings
         """
+        if active_mask is None:
+            active_mask = [True] * len(predictions)
+        active_flags = [bool(active) for active in active_mask]
+
         cur_actions, contents = self.postprocess_predictions(predictions)
-        next_obs, dones, valid_action, is_search = [], [], [], []
+        next_obs, dones, valid_action, is_search, is_vision_search = [], [], [], [], []
         
-        search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
+        search_queries = [
+            content for action, content, active in zip(cur_actions, contents, active_flags)
+            if action == 'search' and active
+        ]
         if do_search:
             search_results = self.batch_search(search_queries)
-            assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
+            assert len(search_results) == len(search_queries)
         else:
-            search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
+            search_results = [''] * len(search_queries)
 
-        for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
+        vision_requests_by_index = {}
+        vision_requests = []
+        for i, (action, content, active) in enumerate(zip(cur_actions, contents, active_flags)):
+            if action != 'vision_search' or not active:
+                continue
+            images = image_batches[i] if image_batches is not None else None
+            request = self._build_vision_search_request(content, images, i)
+            if request is None:
+                continue
+            vision_requests_by_index[i] = request
+            vision_requests.append(request)
+
+        if do_search:
+            vision_search_results = self.batch_vision_search(vision_requests)
+            assert len(vision_search_results) == len(vision_requests)
+        else:
+            vision_search_results = [''] * len(vision_requests)
+
+        for i, (action, active) in enumerate(zip(cur_actions, active_flags)):
             
             if not active:
                 next_obs.append('')
                 dones.append(1)
                 valid_action.append(0)
                 is_search.append(0)
+                is_vision_search.append(0)
             else:
                 if action == 'answer':
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
                     is_search.append(0)
+                    is_vision_search.append(0)
                 elif action == 'search':
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
+                    is_vision_search.append(0)
+                elif action == 'vision_search' and i in vision_requests_by_index:
+                    result = vision_search_results.pop(0).strip()
+                    next_obs.append(
+                        f'\n\n<vision_information>{result}</vision_information>\n\n'
+                    )
+                    dones.append(0)
+                    valid_action.append(1)
+                    is_search.append(0)
+                    is_vision_search.append(1)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
+If I want to search an input image, I should put exactly one image=N reference between <vision_search> and </vision_search>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)
+                    is_vision_search.append(0)
             
         assert len(search_results) == 0
+        assert len(vision_search_results) == 0
             
-        return next_obs, dones, valid_action, is_search
+        return next_obs, dones, valid_action, is_search, is_vision_search
 
-    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
+    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[str], List[str]]:
         """
         Process (text-based) predictions from llm into actions and validity flags.
         
@@ -419,7 +515,7 @@ If I want to give the final answer, I should put the answer between <answer> and
                 
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
-                pattern = r'<(search|answer)>(.*?)</\1>'
+                pattern = r'<(search|vision_search|answer)>(.*?)</\1>'
                 match = re.search(pattern, prediction, re.DOTALL)
                 if match:
                     content = match.group(2).strip()  # Return only the content inside the tags
@@ -435,6 +531,36 @@ If I want to give the final answer, I should put the answer between <answer> and
             
         return actions, contents
 
+    def _normalize_images(self, images: Any) -> List[Any]:
+        if images is None:
+            return []
+        if isinstance(images, np.ndarray):
+            images = images.tolist()
+        if isinstance(images, (list, tuple)):
+            return list(images)
+        return [images]
+
+    def _build_vision_search_request(self, content: str, images: Any, sample_index: int) -> Dict[str, Any]:
+        assignment_pattern = r'(?<!\w)image\s*='
+        value_pattern = r'(?<!\w)image\s*=\s*(\d+)(?=$|[^\w])'
+        assignments = re.findall(assignment_pattern, content)
+        matches = re.findall(value_pattern, content)
+        if len(assignments) != 1 or len(matches) != 1:
+            return None
+
+        image_index = int(matches[0])
+        image_list = self._normalize_images(images)
+        if image_index < 1 or image_index > len(image_list):
+            return None
+
+        return {
+            'sample_index': sample_index,
+            'query': content,
+            'image_index': image_index,
+            'image': image_list[image_index - 1],
+            'images': image_list,
+        }
+
     def batch_search(self, queries: List[str] = None) -> str:
         """
         Batchified search for queries.
@@ -443,9 +569,33 @@ If I want to give the final answer, I should put the answer between <answer> and
         Returns:
             search results which is concatenated into a string
         """
+        if not queries:
+            return []
         results = self._batch_search(queries)['result']
         
         return [self._passages2string(result) for result in results]
+
+    def batch_vision_search(self, vision_requests: List[Dict[str, Any]] = None) -> List[str]:
+        """
+        Batchified image retrieval hook.
+        Each request contains:
+        sample_index, query, image_index (1-based), image, and images.
+        """
+        if not vision_requests:
+            return []
+        results = self._batch_vision_search(vision_requests)['result']
+
+        return [self._captions2string(result) for result in results]
+
+    def _batch_vision_search(self, vision_requests: List[Dict[str, Any]]):
+
+        payload = {
+            "queries": vision_requests,
+            "topk": self.config.topk,
+            "return_scores": True
+        }
+
+        return requests.post(self.config.vision_search_url, json=payload).json()
 
     def _batch_search(self, queries):
         
@@ -465,5 +615,16 @@ If I want to give the final answer, I should put the answer between <answer> and
             title = content.split("\n")[0]
             text = "\n".join(content.split("\n")[1:])
             format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
+
+        return format_reference
+
+    def _captions2string(self, retrieval_result):
+        format_reference = ''
+        for idx, doc_item in enumerate(retrieval_result):
+
+            content = doc_item['document']['contents']
+            title = content.split("\n")[0]
+            text = "\n".join(content.split("\n")[1:])
+            format_reference += f"Caption {idx+1}(Title: {title}) {text}\n"
 
         return format_reference

@@ -8,6 +8,35 @@
 **/playground
 **/wandb
 
+# Vision-Search-R1 local data, retrieval stores, and generated artifacts
+data/
+dataset/
+index/
+corpus/
+retrieval_data/
+example/
+verl_checkpoints/
+runs/
+*.parquet
+*.jsonl
+*.faiss
+*.index
+*.safetensors
+
+# Credentials and local secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+id_rsa*
+credentials*
+secrets*
+token*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
