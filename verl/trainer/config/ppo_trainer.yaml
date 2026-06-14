@@ -371,10 +371,10 @@ transfer_queue:
       # Leave empty to let Mooncake auto-select available devices.
       device_name: ""
 
-# Maximum Vision-Search-R1 agent interaction turns before final generation.
+# Maximum DualSearch agent interaction turns before final generation.
 max_turns: 2
 
-# Vision-Search-R1 retrieval backend configuration.
+# DualSearch retrieval backend configuration.
 retriever:
 
   # Text retrieval HTTP endpoint.

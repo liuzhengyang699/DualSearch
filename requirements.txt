@@ -5,29 +5,41 @@ datasets
 dill
 hydra-core
 liger-kernel
-numpy<2.0.0
+numpy==1.26.4
 pandas
 peft
 pyarrow>=19.0.0
 pybind11
 pylatexenc
-ray[default]
-tensordict>=0.8.0,<=0.10.0,!=0.9.0
-torchdata
-transformers>=4.57.0
+ray[default]==2.55.1
+tensordict==0.10.0
+torchdata==0.11.0
+transformers==4.57.6
 wandb
 packaging>=20.0
 tensorboard
 TransferQueue==0.1.7
 
 # Qwen3-VL / multimodal rollout
-qwen-vl-utils
+qwen-vl-utils==0.0.14
 pillow
-vllm>=0.11.0
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+opencv-python-headless==4.11.0.86
+vllm==0.14.0
 
-# Search-R1 retrieval services
+# Install after vLLM/PyTorch because flash-attn needs --no-build-isolation:
+# MAX_JOBS=8 python -m pip install flash-attn==2.8.3 --no-build-isolation
+
+# DualSearch retrieval services
 fastapi
 uvicorn
 requests
-sentence-transformers
-faiss-cpu
+sentence-transformers==5.5.1
+FlagEmbedding==1.4.0
+rank-bm25==0.2.2
+safetensors==0.8.0
+
+# Install GPU FAISS with conda before pip dependencies:
+# conda install -y -c pytorch -c nvidia "faiss-gpu=1.8.0=py3.10_h4c7d538_0_cuda12.1.1"

@@ -91,31 +91,7 @@ def default_compute_score(
 
         res = geo3k.compute_score(solution_str, ground_truth)
     elif data_source in [
-        "nq",
-        "triviaqa",
-        "popqa",
-        "web_questions",
-        "hotpotqa",
-        "2wikimultihopqa",
-        "musique",
-        "bamboogle",
-        "strategyqa",
-        "vision_search_r1",
-        "VisionSearchR1",
-        "vision-search-r1",
-        "Vision-Search-R1",
-    ]:
-        from . import qa_em_format
-
-        res = qa_em_format.compute_score(solution_str, ground_truth)
-    elif data_source in [
-        "searchR1_nq",
-        "searchR1_triviaqa",
-        "searchR1_popqa",
-        "searchR1_hotpotqa",
-        "searchR1_2wikimultihopqa",
-        "searchR1_musique",
-        "searchR1_bamboogle",
+        "dual_search",
     ]:
         from . import qa_em_format
 

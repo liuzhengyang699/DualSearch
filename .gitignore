@@ -9,14 +9,14 @@
 **/wandb
 
 # Vision-Search-R1 local data, retrieval stores, and generated artifacts
-data/
-dataset/
-index/
-corpus/
-retrieval_data/
-example/
-verl_checkpoints/
-runs/
+/data/
+/dataset/
+/index/
+/corpus/
+/retrieval_data/
+/example/
+/verl_checkpoints/
+/runs/
 *.parquet
 *.jsonl
 *.faiss
@@ -41,7 +41,7 @@ token*
 __pycache__/
 *.py[cod]
 *$py.class
-dataset/*
+/dataset/*
 tensorflow/my_graph/*
 .idea/
 # C extensions

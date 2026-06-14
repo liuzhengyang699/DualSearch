@@ -4,13 +4,13 @@ set -xeuo pipefail
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
-DATA_DIR=${DATA_DIR:-data/nq_search}
+DATA_DIR=${DATA_DIR:-data/evqa_search}
 TRAIN_FILE=${TRAIN_FILE:-${DATA_DIR}/train.parquet}
 TEST_FILE=${TEST_FILE:-${DATA_DIR}/test.parquet}
 
 BASE_MODEL=${BASE_MODEL:-Qwen/Qwen3-VL-4B-Instruct}
-WAND_PROJECT=${WAND_PROJECT:-Vision-Search-R1}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-vision-search-r1-grpo-qwen3-vl-4b}
+WAND_PROJECT=${WAND_PROJECT:-DualSearch}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-dual-search-grpo-qwen3-vl-4b}
 
 TEXT_RETRIEVER_URL=${TEXT_RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}
 VISION_RETRIEVER_URL=${VISION_RETRIEVER_URL:-http://127.0.0.1:8001/vision_retrieve}
@@ -48,8 +48,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576 \
-    actor_rollout_ref.rollout.agent.default_agent_loop=vision_search_r1_agent \
-    actor_rollout_ref.rollout.agent.agent_loop_config_path=vision_search_r1/llm_agent/vision_search_r1_agent_loop.yaml \
+    actor_rollout_ref.rollout.agent.default_agent_loop=dual_search_agent \
+    actor_rollout_ref.rollout.agent.agent_loop_config_path=dual_search/llm_agent/dual_search_agent_loop.yaml \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

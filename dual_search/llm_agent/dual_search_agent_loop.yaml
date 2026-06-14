@@ -1,0 +1,2 @@
+- name: dual_search_agent
+  _target_: dual_search.llm_agent.dual_search_agent_loop.DualSearchAgentLoop

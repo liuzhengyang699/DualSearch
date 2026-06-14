@@ -1,2 +1,0 @@
-- name: vision_search_r1_agent
-  _target_: vision_search_r1.llm_agent.vision_search_r1_agent_loop.VisionSearchR1AgentLoop

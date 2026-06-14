@@ -14,5 +14,6 @@
 
 from .rl_dataset import RLHFDataset
 from .rm_dataset import RMDataset
+from .dataset_utils import DatasetPadMode, SFTTensorCollator
 
-__all__ = ["RLHFDataset", "RMDataset"]
+__all__ = ["DatasetPadMode", "RLHFDataset", "RMDataset", "SFTTensorCollator"]
