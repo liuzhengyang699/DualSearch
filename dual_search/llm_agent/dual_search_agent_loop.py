@@ -66,9 +66,14 @@ class DualSearchAgentLoop(AgentLoopBase):
         valid_action_count = 0
         valid_search_count = 0
         valid_vision_search_count = 0
+        tool_budget_exhausted_count = 0
         num_preempted = 0
+        answer_only_turn = False
 
-        for turn_idx in range(self.max_turns + 1):
+        # max_turns tool-interaction turns, one normal answer turn, and one
+        # additional answer-only turn when the model attempts a tool call after
+        # exhausting the tool budget.
+        for turn_idx in range(self.max_turns + 2):
             remaining = self.response_length - len(response_ids)
             if remaining <= 0:
                 break
@@ -112,16 +117,28 @@ class DualSearchAgentLoop(AgentLoopBase):
                 valid_action_count += 1
                 break
 
-            if turn_idx >= self.max_turns:
+            # The post-budget generation is answer-only: tool actions are never
+            # executed after the budget-exhausted observation.
+            if answer_only_turn:
                 break
 
-            observation_text = await self._build_observation(action, content, image_refs)
-            if action in {"search", "vision_search"} and not observation_text.startswith("\nMy previous action is invalid."):
-                valid_action_count += 1
-                if action == "search":
-                    valid_search_count += 1
+            if turn_idx >= self.max_turns:
+                if action in {"search", "vision_search"}:
+                    observation_text = self._tool_budget_exhausted_observation(action)
+                    tool_budget_exhausted_count += 1
+                    answer_only_turn = True
                 else:
-                    valid_vision_search_count += 1
+                    break
+            else:
+                observation_text = await self._build_observation(action, content, image_refs)
+                if action in {"search", "vision_search"} and not observation_text.startswith(
+                    "\nMy previous action is invalid."
+                ):
+                    valid_action_count += 1
+                    if action == "search":
+                        valid_search_count += 1
+                    else:
+                        valid_vision_search_count += 1
 
             observation_ids = self._encode_observation(observation_text, tag=None)
             remaining = self.response_length - len(response_ids)
@@ -154,6 +171,7 @@ class DualSearchAgentLoop(AgentLoopBase):
                 "valid_action_stats": valid_action_count,
                 "valid_search_stats": valid_search_count,
                 "valid_vision_search_stats": valid_vision_search_count,
+                "tool_budget_exhausted_stats": tool_budget_exhausted_count,
             },
         )
         return output
@@ -195,6 +213,14 @@ class DualSearchAgentLoop(AgentLoopBase):
             "<vision_search> and </vision_search>. "
             "If I want to give the final answer, I should put the answer between <answer> and </answer>. "
             "Let me try again.\n"
+        )
+
+    def _tool_budget_exhausted_observation(self, action: str) -> str:
+        tag = "vision_information" if action == "vision_search" else "information"
+        return self._wrap_tagged_observation(
+            tag,
+            "Tool-call budget exhausted. Answer using the information already obtained. "
+            "Do not call any more tools. Return the final answer inside <answer>...</answer>.",
         )
 
     def _wrap_tagged_observation(self, tag: str, content: str) -> str:
