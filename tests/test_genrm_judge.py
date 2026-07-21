@@ -32,6 +32,21 @@ class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(genrm_judge.extract_question(raw_prompt), "Which species is shown?")
 
+    def test_first_two_retrieval_calls_are_free(self):
+        self.assertEqual(genrm_judge.compute_retrieval_penalty(0), 0.0)
+        self.assertEqual(genrm_judge.compute_retrieval_penalty(1), 0.0)
+        self.assertEqual(genrm_judge.compute_retrieval_penalty(2), 0.0)
+
+    def test_quadratic_retrieval_penalty(self):
+        self.assertAlmostEqual(genrm_judge.compute_retrieval_penalty(4), 0.08)
+        self.assertAlmostEqual(genrm_judge.compute_retrieval_penalty(6), 0.32)
+        self.assertAlmostEqual(genrm_judge.compute_retrieval_penalty(8), 0.72)
+
+    def test_reward_is_not_clipped_at_zero(self):
+        self.assertAlmostEqual(genrm_judge.compute_total_reward(0.0, True, 8), -0.52)
+        self.assertAlmostEqual(genrm_judge.compute_total_reward(1.0, True, 8), 0.28)
+        self.assertAlmostEqual(genrm_judge.compute_total_reward(0.0, False, 8), -0.72)
+
     async def test_correct_judge_output_uses_requested_prompt(self):
         with patch.object(
             genrm_judge,
@@ -50,6 +65,8 @@ class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["score"], 1.0)
         self.assertEqual(result["judge_score"], 1.0)
         self.assertEqual(result["judge_valid"], 1.0)
+        self.assertEqual(result["retrieval_call_count"], 0.0)
+        self.assertEqual(result["retrieval_penalty"], 0.0)
         messages = request_mock.await_args.kwargs["messages"]
         self.assertEqual(messages[0]["content"], genrm_judge.SYSTEM_PROMPT)
         self.assertEqual(
@@ -72,10 +89,13 @@ class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
                 raw_prompt=RAW_PROMPT,
                 reward_router_address="127.0.0.1:9000",
                 genrm_model="/models/small-genrm",
+                extra_info={"valid_search_stats": 4, "valid_vision_search_stats": 4},
             )
 
         self.assertEqual(result["score"], 0.0)
         self.assertEqual(result["judge_valid"], 0.0)
+        self.assertEqual(result["retrieval_call_count"], 8.0)
+        self.assertAlmostEqual(result["retrieval_penalty"], 0.72)
 
     async def test_request_failure_returns_zero(self):
         with patch.object(
@@ -114,6 +134,26 @@ class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["judge_score"], 0.0)
         self.assertEqual(result["format_score"], 1.0)
         self.assertEqual(result["judge_valid"], 1.0)
+
+    async def test_eight_retrieval_calls_can_produce_negative_reward(self):
+        with patch.object(
+            genrm_judge,
+            "request_genrm",
+            new=AsyncMock(return_value='{"score": 0.0}'),
+        ):
+            result = await genrm_judge.compute_score(
+                data_source="dual_search",
+                solution_str=VALID_SOLUTION,
+                ground_truth=GROUND_TRUTH,
+                raw_prompt=RAW_PROMPT,
+                reward_router_address="127.0.0.1:9000",
+                genrm_model="/models/small-genrm",
+                extra_info={"valid_search_stats": 3, "valid_vision_search_stats": 5},
+            )
+
+        self.assertAlmostEqual(result["score"], -0.52)
+        self.assertEqual(result["retrieval_call_count"], 8.0)
+        self.assertAlmostEqual(result["retrieval_penalty"], 0.72)
 
 
 class _FakeTokenizer:
