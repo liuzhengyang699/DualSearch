@@ -21,6 +21,11 @@ Candidate answer: {candidate_answer}"""
 
 QUESTION_MARKER_PATTERN = re.compile(r"(?:^|\n)\s*Question:\s*", re.IGNORECASE)
 
+ANSWER_REWARD_WEIGHT = 0.8
+FORMAT_REWARD_WEIGHT = 0.2
+FREE_RETRIEVAL_CALLS = 2
+RETRIEVAL_PENALTY_COEFFICIENT = 0.02
+
 
 def _to_python(value: Any) -> Any:
     if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
@@ -109,6 +114,35 @@ def parse_judge_score(raw_output: str) -> float | None:
     return score if score in {0.0, 1.0} else None
 
 
+def _nonnegative_int(value: Any) -> int:
+    value = _to_python(value)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def get_retrieval_call_count(extra_info: dict | None) -> int:
+    if not isinstance(extra_info, dict):
+        return 0
+    return _nonnegative_int(extra_info.get("valid_search_stats", 0)) + _nonnegative_int(
+        extra_info.get("valid_vision_search_stats", 0)
+    )
+
+
+def compute_retrieval_penalty(retrieval_call_count: int) -> float:
+    excess_calls = max(0, _nonnegative_int(retrieval_call_count) - FREE_RETRIEVAL_CALLS)
+    return RETRIEVAL_PENALTY_COEFFICIENT * (excess_calls**2)
+
+
+def compute_total_reward(judge_score: float, format_valid: bool, retrieval_call_count: int) -> float:
+    return (
+        ANSWER_REWARD_WEIGHT * float(judge_score)
+        + FORMAT_REWARD_WEIGHT * float(format_valid)
+        - compute_retrieval_penalty(retrieval_call_count)
+    )
+
+
 async def request_genrm(
     reward_router_address: str,
     genrm_model: str,
@@ -138,12 +172,6 @@ async def request_genrm(
     return result["choices"][0]["message"]["content"]
 
 
-def combine_answer_and_format_reward(judge_score: float, format_valid: bool) -> float:
-    if judge_score == 1.0:
-        return 1.0 if format_valid else 0.8
-    return 0.2 if format_valid else 0.1
-
-
 async def compute_score(
     data_source: str,
     solution_str: str,
@@ -156,18 +184,22 @@ async def compute_score(
     request_timeout: float = 120.0,
     **kwargs,
 ) -> dict[str, float]:
-    del data_source, extra_info, reward_model_tokenizer, kwargs
+    del data_source, reward_model_tokenizer, kwargs
 
     format_valid, _ = is_valid_sequence(solution_str)
     candidate_answer = extract_solution(solution_str)
     question = extract_question(raw_prompt)
     reference_answer = format_reference_answer(ground_truth)
+    retrieval_call_count = get_retrieval_call_count(extra_info)
+    retrieval_penalty = compute_retrieval_penalty(retrieval_call_count)
 
     failure = {
         "score": 0.0,
         "judge_score": 0.0,
         "format_score": float(format_valid),
         "judge_valid": 0.0,
+        "retrieval_call_count": float(retrieval_call_count),
+        "retrieval_penalty": retrieval_penalty,
     }
     if not question or not reference_answer or not candidate_answer:
         return failure
@@ -188,8 +220,10 @@ async def compute_score(
         return failure
 
     return {
-        "score": combine_answer_and_format_reward(judge_score, format_valid),
+        "score": compute_total_reward(judge_score, format_valid, retrieval_call_count),
         "judge_score": judge_score,
         "format_score": float(format_valid),
         "judge_valid": 1.0,
+        "retrieval_call_count": float(retrieval_call_count),
+        "retrieval_penalty": retrieval_penalty,
     }
