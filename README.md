@@ -52,11 +52,12 @@ CUDA_VISIBLE_DEVICES=1 python dual_search/search/vision_retrieval_server.py \
 
 ### Train
 
-Keep both retrieval services running before training:
+Keep both retrieval services running before training. Set `GENRM_MODEL` to the local path of a small generative reward model; the placeholder `/path/to/GenRM` cannot start training. veRL launches and manages the GenRM with tensor parallel size 1.
 
 ```bash
 export TEXT_RETRIEVER_URL=http://127.0.0.1:8000/retrieve
 export VISION_RETRIEVER_URL=http://127.0.0.1:8001/vision_retrieve
+export GENRM_MODEL=/actual/path/to/small/GenRM
 bash train_grpo.sh
 ```
 
@@ -109,11 +110,12 @@ CUDA_VISIBLE_DEVICES=1 python dual_search/search/vision_retrieval_server.py \
 
 ### 训练
 
-训练前需要保持两个检索服务运行：
+训练前需要保持两个检索服务运行。必须将 `GENRM_MODEL` 指定为本地小模型 GenRM 的真实路径；占位路径 `/path/to/GenRM` 无法启动训练。GenRM 由 veRL 启动和管理，使用 TP=1。
 
 ```bash
 export TEXT_RETRIEVER_URL=http://127.0.0.1:8000/retrieve
 export VISION_RETRIEVER_URL=http://127.0.0.1:8001/vision_retrieve
+export GENRM_MODEL=/actual/path/to/small/GenRM
 bash train_grpo.sh
 ```
 
