@@ -19,7 +19,7 @@ Reference answer: {reference_answer}
 
 Candidate answer: {candidate_answer}"""
 
-QUESTION_PATTERN = re.compile(r"(?:^|\n)\s*Question:\s*(.*?)\s*$", re.IGNORECASE | re.DOTALL)
+QUESTION_MARKER_PATTERN = re.compile(r"(?:^|\n)\s*Question:\s*", re.IGNORECASE)
 
 
 def _to_python(value: Any) -> Any:
@@ -66,9 +66,9 @@ def extract_question(raw_prompt: Any) -> str:
         text = _content_to_text(message.get("content", "")).strip()
         if not text:
             continue
-        matches = QUESTION_PATTERN.findall(text)
+        matches = list(QUESTION_MARKER_PATTERN.finditer(text))
         if matches:
-            return matches[-1].strip()
+            return text[matches[-1].end() :].strip()
         return text
     return ""
 
