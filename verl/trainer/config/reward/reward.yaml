@@ -11,6 +11,8 @@ custom_reward_function:
   path: null
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
+  # Extra keyword arguments forwarded to the custom reward function.
+  reward_kwargs: {}
 
 # reward manager, see `verl/trainer/config/reward_manager.yaml` for details.
 reward_manager:
