@@ -9,11 +9,18 @@ TRAIN_FILE=${TRAIN_FILE:-${DATA_DIR}/train.parquet}
 TEST_FILE=${TEST_FILE:-${DATA_DIR}/test.parquet}
 
 BASE_MODEL=${BASE_MODEL:-Qwen/Qwen3-VL-4B-Instruct}
+GENRM_MODEL=${GENRM_MODEL:-/path/to/GenRM}
+GENRM_TIMEOUT=${GENRM_TIMEOUT:-120}
 WAND_PROJECT=${WAND_PROJECT:-DualSearch}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-dual-search-grpo-qwen3-vl-4b}
 
 TEXT_RETRIEVER_URL=${TEXT_RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}
 VISION_RETRIEVER_URL=${VISION_RETRIEVER_URL:-http://127.0.0.1:8001/vision_retrieve}
+
+if [[ "${GENRM_MODEL}" == "/path/to/GenRM" ]]; then
+    echo "GENRM_MODEL is still the placeholder /path/to/GenRM. Set it to a real local GenRM path before training." >&2
+    exit 1
+fi
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -53,6 +60,22 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    reward.custom_reward_function.path=dual_search/reward/genrm_judge.py \
+    reward.custom_reward_function.name=compute_score \
+    +reward.custom_reward_function.reward_kwargs.genrm_model="${GENRM_MODEL}" \
+    +reward.custom_reward_function.reward_kwargs.request_timeout="${GENRM_TIMEOUT}" \
+    reward.reward_model.enable=True \
+    reward.reward_model.enable_resource_pool=False \
+    reward.reward_model.model_path="${GENRM_MODEL}" \
+    reward.reward_model.rollout.name=vllm \
+    reward.reward_model.rollout.tensor_model_parallel_size=1 \
+    reward.reward_model.rollout.data_parallel_size=1 \
+    reward.reward_model.rollout.pipeline_model_parallel_size=1 \
+    reward.reward_model.rollout.temperature=0.0 \
+    reward.reward_model.rollout.top_p=1.0 \
+    reward.reward_model.rollout.do_sample=False \
+    reward.reward_model.rollout.response_length=32 \
+    reward.reward_model.rollout.gpu_memory_utilization=0.5 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${WAND_PROJECT}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
