@@ -61,6 +61,14 @@ export GENRM_MODEL=/actual/path/to/small/GenRM
 bash train_grpo.sh
 ```
 
+The reward is modeled as:
+
+```text
+R = 0.8 * R_answer + 0.2 * R_format - 0.02 * max(0, N - 2)^2
+```
+
+`R_answer` and `R_format` are binary. `N` is the total number of successfully executed text and vision retrieval calls. The first two calls are free, the maximum tool-call budget is 8, and negative rewards are retained.
+
 ### Acknowledgements
 
 DualSearch is developed based on [Search-R1](https://github.com/PeterGriffinJin/Search-R1), and uses related works and models including [Qwen3-VL-Embedding](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B), [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3), [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct), and [veRL](https://github.com/volcengine/verl).
@@ -118,6 +126,14 @@ export VISION_RETRIEVER_URL=http://127.0.0.1:8001/vision_retrieve
 export GENRM_MODEL=/actual/path/to/small/GenRM
 bash train_grpo.sh
 ```
+
+当前奖励建模为：
+
+```text
+R = 0.8 * R_answer + 0.2 * R_format - 0.02 * max(0, N - 2)^2
+```
+
+其中 `R_answer` 和 `R_format` 为二值奖励，`N` 为实际成功执行的文本检索与视觉检索总次数。前两次检索不惩罚，最大工具调用次数为 8，最终奖励允许为负数。
 
 ### 致谢
 
