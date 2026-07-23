@@ -33,11 +33,13 @@ from dual_search.data.fingerprints import (
 )
 
 
-PIPELINE_SCHEMA_VERSION = 1
+PIPELINE_SCHEMA_VERSION = 2
 SUPPORTED_DATASET = "inaturalist"
 GLDV2_NAMES = {"gldv2", "google_landmarks", "google_landmarks_v2", "landmarks"}
 DEFAULT_PROMPT_TEMPLATE = (
-    "<image>\nAnswer the question about the image. You may use the available "
+    "{image_block}\n"
+    "Images are numbered from 1 in the order shown above.\n"
+    "Answer the question about the images. You may use the available "
     "vision_search and search tools when external evidence is needed, but call "
     "at most one tool in each assistant turn. Reason "
     "inside <think>...</think> and return the final answer inside "
@@ -284,6 +286,70 @@ def atomic_write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
 
     _atomic_replace_writer(path, write)
     return count
+
+
+def _publish_artifact_set(
+    staged_paths: Mapping[str, Path],
+    final_paths: Mapping[str, Path],
+) -> None:
+    """Publish a related artifact set with best-effort transactional rollback.
+
+    POSIX has no atomic rename for multiple files. Move any previous generation
+    aside first, publish every staged member, and restore the complete previous
+    generation if one replacement fails. The manifest/report must be ordered
+    last by callers so consumers never receive a commit marker for an
+    incomplete generation.
+    """
+
+    if list(staged_paths) != list(final_paths):
+        raise ValueError("staged and final artifact sets must have the same ordered keys")
+    for name, staged in staged_paths.items():
+        if not staged.is_file():
+            raise FileNotFoundError(f"staged artifact {name!r} is missing: {staged}")
+
+    backups: dict[str, Path] = {}
+    published: list[str] = []
+    try:
+        for name, final in final_paths.items():
+            final.parent.mkdir(parents=True, exist_ok=True)
+            if not final.exists():
+                continue
+            descriptor, backup_name = tempfile.mkstemp(
+                prefix=f".{final.name}.",
+                suffix=".backup",
+                dir=final.parent,
+            )
+            os.close(descriptor)
+            backup = Path(backup_name)
+            backup.unlink()
+            os.replace(final, backup)
+            backups[name] = backup
+
+        for name, staged in staged_paths.items():
+            os.replace(staged, final_paths[name])
+            published.append(name)
+    except Exception as publish_error:
+        rollback_errors: list[str] = []
+        for name in reversed(published):
+            try:
+                final_paths[name].unlink(missing_ok=True)
+            except OSError as exc:
+                rollback_errors.append(f"remove {final_paths[name]}: {exc}")
+        for name, backup in reversed(list(backups.items())):
+            try:
+                if backup.exists():
+                    os.replace(backup, final_paths[name])
+            except OSError as exc:
+                rollback_errors.append(f"restore {final_paths[name]}: {exc}")
+        if rollback_errors:
+            raise RuntimeError(
+                "Artifact publication failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from publish_error
+        raise
+    else:
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -703,15 +769,28 @@ def _lookup_query_image(
     return value
 
 
-def _sample_id(row: Mapping[str, Any], official_split: str, image_key: str) -> str:
+def _sample_id(
+    row: Mapping[str, Any],
+    official_split: str,
+    source_row_index: int,
+    image_keys: list[str],
+) -> str:
+    question_id = clean_text(row.get("question_id") or row.get("id"))
     identity = {
         "official_split": official_split,
-        "question_id": clean_text(row.get("question_id") or row.get("id")),
+        "question_id": question_id or f"source-row:{source_row_index}",
         "question": clean_text(row.get("question")),
+        "question_original": clean_text(row.get("question_original")),
+        "question_type": clean_text(row.get("question_type")),
         "answer": clean_text(row.get("answer")),
+        "multi_answer": clean_text(row.get("multi_answer")),
+        "evidence": clean_text(row.get("evidence")),
+        "evidence_section_id": clean_text(row.get("evidence_section_id")),
+        "evidence_section_title": clean_text(row.get("evidence_section_title")),
         "wikipedia_url": [pair["normalized_url"] for pair in row_wiki_pairs(row)],
         "dataset_category_id": clean_text(row.get("dataset_category_id")),
-        "image_key": image_key,
+        # The order is part of the identity because it defines image_index.
+        "image_keys": image_keys,
     }
     return f"evqa:{stable_digest(identity)[:24]}"
 
@@ -721,12 +800,27 @@ def _logical_sample(
     *,
     official_split: str,
     source_row_index: int,
-    image: Mapping[str, Any],
-    all_image_ids: list[str],
+    images: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    sample_id = _sample_id(row, official_split, str(image["image_key"]))
+    query_images = [
+        {
+            "image_index": image_index,
+            "dataset_image_id": str(image["image_id"]),
+            "image_key": str(image["image_key"]),
+            "image": str(image["normalized_path"]),
+            "source_file_name": str(image["file_name"]),
+            "source_split": str(image["source_split"]),
+        }
+        for image_index, image in enumerate(images, start=1)
+    ]
+    image_keys = [image["image_key"] for image in query_images]
+    sample_id = _sample_id(row, official_split, source_row_index, image_keys)
+    category_id = str(images[0]["category_id"] or "")
+    category_key = str(images[0]["category_key"] or "")
     return {
+        "schema_version": PIPELINE_SCHEMA_VERSION,
         "sample_id": sample_id,
+        "question_id": clean_text(row.get("question_id") or row.get("id")),
         "official_split": official_split,
         "source_row_index": source_row_index,
         "dataset_name": SUPPORTED_DATASET,
@@ -742,20 +836,205 @@ def _logical_sample(
         "wikipedia_title": clean_text(row.get("wikipedia_title")),
         "wikipedia_url": clean_text(row.get("wikipedia_url")),
         "wiki_pairs": row_wiki_pairs(row),
-        "dataset_image_id": str(image["image_id"]),
-        "all_image_ids": all_image_ids,
-        "image_key": str(image["image_key"]),
-        "image": str(image["normalized_path"]),
-        "source_file_name": str(image["file_name"]),
-        "source_split": str(image["source_split"]),
-        "dataset_category_id": str(image["category_id"] or ""),
-        "category_key": str(image["category_key"] or ""),
+        "query_images": query_images,
+        "image_keys": image_keys,
+        "image_count": len(query_images),
+        "dataset_category_id": category_id,
+        "category_key": category_key,
     }
+
+
+def _dataset_distribution(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize parent questions and their ordered query images."""
+
+    row_list = list(rows)
+    image_count_histogram: Counter[str] = Counter()
+    by_question_type: dict[str, Counter[str]] = defaultdict(Counter)
+    by_category: dict[str, Counter[str]] = defaultdict(Counter)
+    query_image_count = 0
+    single_image_questions = 0
+    multi_image_questions = 0
+    resolvable = 0
+    unresolvable = 0
+    unresolvable_reasons: Counter[str] = Counter()
+    has_resolvability = False
+
+    for row in row_list:
+        image_count = int(row.get("image_count") or len(row.get("query_images") or []))
+        query_image_count += image_count
+        image_count_histogram[str(image_count)] += 1
+        single_image_questions += int(image_count == 1)
+        multi_image_questions += int(image_count > 1)
+        question_type = clean_text(row.get("question_type")) or "<missing>"
+        category_key = clean_text(row.get("category_key")) or "<missing>"
+        for bucket in (by_question_type[question_type], by_category[category_key]):
+            bucket["questions"] += 1
+            bucket["query_images"] += image_count
+
+        if "retrieval_resolvable" not in row:
+            continue
+        has_resolvability = True
+        if bool(row["retrieval_resolvable"]):
+            resolvable += 1
+            by_question_type[question_type]["retrieval_resolvable"] += 1
+            by_category[category_key]["retrieval_resolvable"] += 1
+            continue
+        unresolvable += 1
+        by_question_type[question_type]["unresolvable"] += 1
+        by_category[category_key]["unresolvable"] += 1
+        if not bool(row.get("vision_resolvable")):
+            unresolvable_reasons["no_visual_positive"] += 1
+            by_question_type[question_type]["reason:no_visual_positive"] += 1
+            by_category[category_key]["reason:no_visual_positive"] += 1
+        if not bool(row.get("text_resolvable")):
+            unresolvable_reasons["missing_text_evidence"] += 1
+            by_question_type[question_type]["reason:missing_text_evidence"] += 1
+            by_category[category_key]["reason:missing_text_evidence"] += 1
+
+    result: dict[str, Any] = {
+        "rl_questions": len(row_list),
+        "query_images": query_image_count,
+        "single_image_questions": single_image_questions,
+        "multi_image_questions": multi_image_questions,
+        "image_count_histogram": dict(
+            sorted(image_count_histogram.items(), key=lambda item: int(item[0]))
+        ),
+        "by_question_type": {
+            key: dict(sorted(counts.items()))
+            for key, counts in sorted(by_question_type.items())
+        },
+        "by_category": {
+            key: dict(sorted(counts.items()))
+            for key, counts in sorted(by_category.items())
+        },
+    }
+    if has_resolvability:
+        result["retrieval_resolvable"] = resolvable
+        result["retrieval_unresolvable"] = unresolvable
+        result["unresolvable_reasons"] = dict(sorted(unresolvable_reasons.items()))
+    return result
+
+
+def _require_schema_v2(value: Mapping[str, Any], label: str) -> None:
+    if value.get("schema_version") != PIPELINE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Incompatible {label} schema_version={value.get('schema_version')!r}; "
+            "this pipeline requires schema_version=2. Rerun catalog, split, corpus, and sft."
+        )
+
+
+def _validate_logical_v2(rows: Iterable[Mapping[str, Any]], label: str) -> None:
+    ambiguous_scalar_fields = {
+        "dataset_image_id",
+        "image_key",
+        "image",
+        "source_file_name",
+        "source_split",
+        "all_image_ids",
+    }
+    required_image_fields = {
+        "image_index",
+        "dataset_image_id",
+        "image_key",
+        "image",
+        "source_file_name",
+        "source_split",
+    }
+    for row in rows:
+        raw_sample_id = clean_text(row.get("sample_id"))
+        sample_id = raw_sample_id or "<missing>"
+        _require_schema_v2(row, f"{label} logical sample {sample_id}")
+        if not raw_sample_id:
+            raise ValueError(f"Logical {label} sample is missing sample_id.")
+        present_ambiguous = sorted(ambiguous_scalar_fields.intersection(row))
+        if present_ambiguous:
+            raise ValueError(
+                f"Logical sample {sample_id} contains obsolete scalar image fields "
+                f"{present_ambiguous}. Rerun split, corpus, and sft."
+            )
+        query_images = row.get("query_images")
+        if not isinstance(query_images, list) or not query_images:
+            raise ValueError(f"Logical sample {sample_id} has no query_images.")
+        expected_indices = list(range(1, len(query_images) + 1))
+        indices: list[Any] = []
+        seen_image_keys: set[str] = set()
+        for image in query_images:
+            if not isinstance(image, dict):
+                raise ValueError(f"Logical sample {sample_id} has a non-object query image.")
+            if set(image) != required_image_fields:
+                raise ValueError(
+                    f"Logical sample {sample_id} query image fields do not match schema v2."
+                )
+            indices.append(image.get("image_index"))
+            required_strings = (
+                clean_text(image.get("dataset_image_id")),
+                clean_text(image.get("image_key")),
+                clean_text(image.get("image")),
+                clean_text(image.get("source_file_name")),
+                clean_text(image.get("source_split")),
+            )
+            if not all(required_strings):
+                raise ValueError(
+                    f"Logical sample {sample_id} has an incomplete query image."
+                )
+            if clean_text(image.get("source_split")) != clean_text(row.get("official_split")):
+                raise ValueError(
+                    f"Logical sample {sample_id} contains a query image from the wrong "
+                    "official iNaturalist split."
+                )
+            image_key = clean_text(image.get("image_key"))
+            if image_key in seen_image_keys:
+                raise ValueError(
+                    f"Logical sample {sample_id} contains duplicate query image {image_key}."
+                )
+            seen_image_keys.add(image_key)
+        if indices != expected_indices:
+            raise ValueError(
+                f"Logical sample {sample_id} has non-contiguous 1-based image_index values."
+            )
+        image_keys = [clean_text(image.get("image_key")) for image in query_images]
+        if row.get("image_keys") != image_keys:
+            raise ValueError(f"Logical sample {sample_id} has inconsistent image_keys.")
+        if row.get("image_count") != len(query_images):
+            raise ValueError(f"Logical sample {sample_id} has inconsistent image_count.")
+        if not clean_text(row.get("category_key")) or not clean_text(
+            row.get("dataset_category_id")
+        ):
+            raise ValueError(
+                f"Logical sample {sample_id} is missing its shared category identity."
+            )
+        source_row_index = row.get("source_row_index")
+        if (
+            isinstance(source_row_index, bool)
+            or not isinstance(source_row_index, int)
+            or source_row_index < 0
+        ):
+            raise ValueError(
+                f"Logical sample {sample_id} has an invalid source_row_index."
+            )
+        expected_sample_id = _sample_id(
+            row,
+            clean_text(row.get("official_split")),
+            source_row_index,
+            image_keys,
+        )
+        if sample_id != expected_sample_id:
+            raise ValueError(
+                f"Logical sample {sample_id} no longer matches its stable identity. "
+                "Rerun split, corpus, and sft."
+            )
 
 
 def build_split(sources: PipelineSources) -> dict[str, Any]:
     if not sources.catalog_path.is_file():
         raise FileNotFoundError("catalog.sqlite is missing; run the catalog stage first.")
+    catalog_manifest_path = sources.output_dir / "catalog_manifest.json"
+    if not catalog_manifest_path.is_file():
+        raise FileNotFoundError(
+            "catalog_manifest.json is missing; rerun catalog, split, corpus, and sft."
+        )
+    catalog_manifest = json.loads(catalog_manifest_path.read_text(encoding="utf-8"))
+    _require_schema_v2(catalog_manifest, "catalog manifest")
     split_inputs = {
         "evqa_train_csv": _source_fingerprint(sources.evqa_train, "evqa.train_csv"),
         "evqa_val_csv": _source_fingerprint(sources.evqa_val, "evqa.val_csv"),
@@ -795,6 +1074,8 @@ def build_split(sources: PipelineSources) -> dict[str, Any]:
                         }
                     )
                     continue
+                resolved_images: list[dict[str, Any]] = []
+                row_has_errors = False
                 for image_id in image_ids:
                     image = _lookup_query_image(connection, image_id, official_split)
                     if image is None:
@@ -808,6 +1089,7 @@ def build_split(sources: PipelineSources) -> dict[str, Any]:
                                 "reason": "found_only_in_wrong_split" if exists_elsewhere else "missing_catalog_image",
                             }
                         )
+                        row_has_errors = True
                         continue
                     declared_category = clean_text(row.get("dataset_category_id"))
                     actual_category = clean_text(image.get("category_id"))
@@ -820,6 +1102,7 @@ def build_split(sources: PipelineSources) -> dict[str, Any]:
                                 "reason": "missing_catalog_category",
                             }
                         )
+                        row_has_errors = True
                         continue
                     if declared_category and declared_category != actual_category:
                         category_mismatches.append(
@@ -829,20 +1112,38 @@ def build_split(sources: PipelineSources) -> dict[str, Any]:
                                 "image_id": image_id,
                                 "declared": declared_category,
                                 "catalog": actual_category,
+                                "reason": "declared_category_mismatch",
                             }
                         )
+                        row_has_errors = True
                         continue
-                    sample = _logical_sample(
-                        row,
-                        official_split=official_split,
-                        source_row_index=row_index,
-                        image=image,
-                        all_image_ids=image_ids,
+                    resolved_images.append(image)
+                actual_categories = {
+                    clean_text(image.get("category_id")) for image in resolved_images
+                }
+                if len(actual_categories) > 1:
+                    category_mismatches.append(
+                        {
+                            "official_split": official_split,
+                            "source_row_index": row_index,
+                            "image_ids": [str(image["image_id"]) for image in resolved_images],
+                            "catalog_categories": sorted(actual_categories),
+                            "reason": "inconsistent_query_categories",
+                        }
                     )
-                    if sample["sample_id"] in sample_ids:
-                        raise ValueError(f"Duplicate stable sample ID: {sample['sample_id']}")
-                    sample_ids.add(sample["sample_id"])
-                    logical_by_split[output_split].append(sample)
+                    row_has_errors = True
+                if row_has_errors:
+                    continue
+                sample = _logical_sample(
+                    row,
+                    official_split=official_split,
+                    source_row_index=row_index,
+                    images=resolved_images,
+                )
+                if sample["sample_id"] in sample_ids:
+                    raise ValueError(f"Duplicate stable sample ID: {sample['sample_id']}")
+                sample_ids.add(sample["sample_id"])
+                logical_by_split[output_split].append(sample)
     finally:
         connection.close()
 
@@ -867,40 +1168,82 @@ def build_split(sources: PipelineSources) -> dict[str, Any]:
     for rows in logical_by_split.values():
         rows.sort(key=lambda item: item["sample_id"])
     heldout_keys = sorted(
-        {row["image_key"] for rows in logical_by_split.values() for row in rows}
+        {
+            image["image_key"]
+            for rows in logical_by_split.values()
+            for row in rows
+            for image in row["query_images"]
+        }
     )
     heldout_paths = sorted(
-        {normalize_local_path(row["image"]) for rows in logical_by_split.values() for row in rows}
+        {
+            normalize_local_path(image["image"])
+            for rows in logical_by_split.values()
+            for row in rows
+            for image in row["query_images"]
+        }
     )
     relevant_categories = sorted(
         {row["dataset_category_id"] for rows in logical_by_split.values() for row in rows}
     )
-    train_path = sources.output_dir / "logical_train.jsonl"
-    test_path = sources.output_dir / "logical_test.jsonl"
-    atomic_write_jsonl(train_path, logical_by_split["train"])
-    atomic_write_jsonl(test_path, logical_by_split["test"])
-    heldout_manifest = {
-        "schema_version": PIPELINE_SCHEMA_VERSION,
-        "created_at": utc_now(),
-        "image_keys": heldout_keys,
-        "normalized_paths": heldout_paths,
-        "image_keys_sha256": stable_digest(heldout_keys),
-        "normalized_paths_sha256": stable_digest(heldout_paths),
-        "relevant_category_ids": relevant_categories,
-    }
-    atomic_write_json(sources.output_dir / "heldout_manifest.json", heldout_manifest)
-    report = {
-        **preflight,
-        "train_samples": len(logical_by_split["train"]),
-        "test_samples": len(logical_by_split["test"]),
-        "heldout_images": len(heldout_keys),
-        "relevant_categories": len(relevant_categories),
-        "logical_train_path": str(train_path),
-        "logical_test_path": str(test_path),
-        "heldout_manifest_path": str(sources.output_dir / "heldout_manifest.json"),
-    }
-    atomic_write_json(sources.output_dir / "split_report.json", report)
-    return report
+    sources.output_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(prefix=".split-stage-", dir=sources.output_dir))
+    try:
+        final_paths = {
+            "logical_train": sources.output_dir / "logical_train.jsonl",
+            "logical_test": sources.output_dir / "logical_test.jsonl",
+            "heldout_manifest": sources.output_dir / "heldout_manifest.json",
+            # Publish this commit marker last.
+            "split_report": sources.output_dir / "split_report.json",
+        }
+        staged_paths = {
+            name: staging_dir / final.name for name, final in final_paths.items()
+        }
+        atomic_write_jsonl(staged_paths["logical_train"], logical_by_split["train"])
+        atomic_write_jsonl(staged_paths["logical_test"], logical_by_split["test"])
+        heldout_manifest = {
+            "schema_version": PIPELINE_SCHEMA_VERSION,
+            "created_at": utc_now(),
+            "image_keys": heldout_keys,
+            "normalized_paths": heldout_paths,
+            "image_keys_sha256": stable_digest(heldout_keys),
+            "normalized_paths_sha256": stable_digest(heldout_paths),
+            "relevant_category_ids": relevant_categories,
+        }
+        atomic_write_json(staged_paths["heldout_manifest"], heldout_manifest)
+        distribution = {
+            "train": _dataset_distribution(logical_by_split["train"]),
+            "test": _dataset_distribution(logical_by_split["test"]),
+            "overall": _dataset_distribution(
+                logical_by_split["train"] + logical_by_split["test"]
+            ),
+        }
+        split_artifacts = {
+            name: _artifact_record(
+                staged_paths[name],
+                jsonl=name in {"logical_train", "logical_test"},
+            )
+            for name in ("logical_train", "logical_test", "heldout_manifest")
+        }
+        for name, record in split_artifacts.items():
+            record["path"] = str(final_paths[name])
+        report = {
+            **preflight,
+            "train_samples": len(logical_by_split["train"]),
+            "test_samples": len(logical_by_split["test"]),
+            "distribution": distribution,
+            "heldout_images": len(heldout_keys),
+            "relevant_categories": len(relevant_categories),
+            "logical_train_path": str(final_paths["logical_train"]),
+            "logical_test_path": str(final_paths["logical_test"]),
+            "heldout_manifest_path": str(final_paths["heldout_manifest"]),
+            "artifacts": split_artifacts,
+        }
+        atomic_write_json(staged_paths["split_report"], report)
+        _publish_artifact_set(staged_paths, final_paths)
+        return report
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _catalog_rows_for_categories(
@@ -1076,8 +1419,13 @@ def _materialize_images(
             (split, name, str(target), kind, int(not _valid_image(target))),
         )
 
-    for row in query_rows:
-        add_member(row, "query")
+    flattened_queries = [
+        (row, image)
+        for row in query_rows
+        for image in row["query_images"]
+    ]
+    for _, image in flattened_queries:
+        add_member(image, "query")
     for index, row in enumerate(iter_jsonl_rows(candidate_path), start=1):
         add_member(row, "retrieval")
         if index % 10000 == 0:
@@ -1118,15 +1466,16 @@ def _materialize_images(
             extracted_by_split[split] = 0
 
     missing_queries: list[dict[str, Any]] = []
-    for row in query_rows:
-        query_path = Path(row["image"])
+    for parent, image in flattened_queries:
+        query_path = Path(image["image"])
         if not _valid_image(query_path):
             missing_queries.append(
                 {
-                    "sample_id": row["sample_id"],
-                    "image_key": row["image_key"],
-                    "path": row["image"],
-                    "source_split": row["source_split"],
+                    "sample_id": parent["sample_id"],
+                    "image_index": image["image_index"],
+                    "image_key": image["image_key"],
+                    "path": image["image"],
+                    "source_split": image["source_split"],
                     "reason": (
                         "missing_query_archive_member_or_file"
                         if not query_path.is_file()
@@ -1167,6 +1516,7 @@ def _materialize_images(
     connection.close()
     return usable_path, {
         "extracted_by_split": extracted_by_split,
+        "query_images": len(flattened_queries),
         "usable_candidates": usable_count,
         "dropped_candidate_count": dropped_count,
         "dropped_candidates": dropped_preview,
@@ -1337,11 +1687,19 @@ def _rl_sample(
         "text_resolvable": text_resolvable,
         "retrieval_resolvable": retrieval_resolvable,
     }
+    query_images = [dict(image) for image in logical["query_images"]]
+    image_block = "\n".join(
+        f"Image {image['image_index']}:\n<image>" for image in query_images
+    )
     return {
+        "schema_version": PIPELINE_SCHEMA_VERSION,
         "data_source": "dual_search",
         "sample_id": logical["sample_id"],
-        "image_key": logical["image_key"],
         "category_key": logical["category_key"],
+        "dataset_category_id": logical["dataset_category_id"],
+        "query_images": query_images,
+        "image_keys": list(logical["image_keys"]),
+        "image_count": int(logical["image_count"]),
         "question": question,
         "answer": logical.get("answer", ""),
         "question_type": logical.get("question_type", ""),
@@ -1352,10 +1710,13 @@ def _rl_sample(
         "prompt": [
             {
                 "role": "user",
-                "content": DEFAULT_PROMPT_TEMPLATE.format(question=question),
+                "content": DEFAULT_PROMPT_TEMPLATE.format(
+                    image_block=image_block,
+                    question=question,
+                ),
             }
         ],
-        "images": [{"image": logical["image"]}],
+        "images": [{"image": image["image"]} for image in query_images],
         "ability": "vision-search",
         "reward_model": {"style": "rule", "ground_truth": {"target": answers}},
         "extra_info": extra_info,
@@ -1366,8 +1727,15 @@ def _write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
     if not rows:
         raise ValueError(f"Refusing to create an empty RL dataset: {path.name}")
     for row in rows:
+        _require_schema_v2(row, f"RL sample {row.get('sample_id', '<missing>')}")
         if not row["reward_model"]["ground_truth"]["target"]:
             raise ValueError(f"Sample {row['sample_id']} has no answer target.")
+        if row.get("image_count") != len(row.get("query_images") or []):
+            raise ValueError(f"Sample {row['sample_id']} has inconsistent image_count.")
+        if row.get("image_keys") != [
+            image.get("image_key") for image in row.get("query_images") or []
+        ]:
+            raise ValueError(f"Sample {row['sample_id']} has inconsistent image_keys.")
         prompt_text = "".join(message.get("content", "") for message in row["prompt"])
         if prompt_text.count("<image>") != len(row["images"]):
             raise ValueError(f"Sample {row['sample_id']} has mismatched image placeholders.")
@@ -1381,6 +1749,31 @@ def _artifact_record(path: Path, *, jsonl: bool = False) -> dict[str, Any]:
     if jsonl:
         result.update(corpus_fingerprint(path))
     return result
+
+
+def _require_artifact_matches(
+    expected: Mapping[str, Any],
+    path: Path,
+    *,
+    label: str,
+    jsonl: bool = False,
+) -> None:
+    required = {"sha256"}
+    if jsonl:
+        required.update({"fingerprint_schema_version", "id_order_sha256", "row_count"})
+    missing = sorted(required.difference(expected))
+    if missing:
+        raise ValueError(
+            f"Split report has no complete fingerprint for {label}: missing {missing}. "
+            "Rerun split and corpus."
+        )
+    actual = _artifact_record(path, jsonl=jsonl)
+    mismatched = sorted(key for key in required if actual.get(key) != expected.get(key))
+    if mismatched:
+        raise ValueError(
+            f"{label} changed after split construction (fingerprint mismatch: {mismatched}). "
+            "Rerun split and corpus."
+        )
 
 
 def _build_corpus_impl(sources: PipelineSources) -> dict[str, Any]:
@@ -1401,6 +1794,7 @@ def _build_corpus_impl(sources: PipelineSources) -> dict[str, Any]:
             raise FileNotFoundError(f"Required split artifact is missing: {path}")
     consumed_inputs = _consumed_input_fingerprints(sources)
     catalog_manifest = json.loads(catalog_manifest_path.read_text(encoding="utf-8"))
+    _require_schema_v2(catalog_manifest, "catalog manifest")
     expected_metadata = catalog_manifest.get("input_sha256") or {}
     for old_key, new_key in (
         ("inaturalist.train.metadata", "inaturalist_train_metadata"),
@@ -1411,11 +1805,36 @@ def _build_corpus_impl(sources: PipelineSources) -> dict[str, Any]:
                 f"iNaturalist metadata changed after catalog construction: {new_key}. "
                 "Rerun catalog and split."
             )
-    logical_train = read_jsonl(logical_train_path)
-    logical_test = read_jsonl(logical_test_path)
-    query_rows = logical_train + logical_test
     heldout = json.loads(heldout_path.read_text(encoding="utf-8"))
     split_report = json.loads(split_report_path.read_text(encoding="utf-8"))
+    _require_schema_v2(heldout, "heldout manifest")
+    _require_schema_v2(split_report, "split report")
+    split_artifacts = split_report.get("artifacts")
+    if not isinstance(split_artifacts, Mapping):
+        raise ValueError(
+            "Split report has no schema v2 artifact fingerprints. Rerun split and corpus."
+        )
+    logical_train = read_jsonl(logical_train_path)
+    logical_test = read_jsonl(logical_test_path)
+    _validate_logical_v2(logical_train, "train")
+    _validate_logical_v2(logical_test, "test")
+    for name, path, is_jsonl in (
+        ("logical_train", logical_train_path, True),
+        ("logical_test", logical_test_path, True),
+        ("heldout_manifest", heldout_path, False),
+    ):
+        expected = split_artifacts.get(name)
+        if not isinstance(expected, Mapping):
+            raise ValueError(
+                f"Split report has no fingerprint for {name}. Rerun split and corpus."
+            )
+        _require_artifact_matches(
+            expected,
+            path,
+            label=name,
+            jsonl=is_jsonl,
+        )
+    query_rows = logical_train + logical_test
     split_inputs = split_report.get("inputs") or {}
     for key in ("evqa_train_csv", "evqa_val_csv"):
         if (split_inputs.get(key) or {}).get("sha256") != consumed_inputs[key]["sha256"]:
@@ -1423,9 +1842,37 @@ def _build_corpus_impl(sources: PipelineSources) -> dict[str, Any]:
     current_catalog_sha256 = sha256_file(sources.catalog_path)
     if (split_inputs.get("inat_catalog") or {}).get("sha256") != current_catalog_sha256:
         raise ValueError("iNaturalist catalog changed after split construction. Rerun split.")
-    heldout_keys = set(heldout["image_keys"])
-    heldout_paths = {normalize_local_path(path) for path in heldout["normalized_paths"]}
-    relevant_categories = set(heldout["relevant_category_ids"])
+    expected_heldout_keys = sorted(
+        {
+            str(image["image_key"])
+            for row in query_rows
+            for image in row["query_images"]
+        }
+    )
+    expected_heldout_paths = sorted(
+        {
+            normalize_local_path(image["image"])
+            for row in query_rows
+            for image in row["query_images"]
+        }
+    )
+    expected_categories = sorted(
+        {str(row["dataset_category_id"]) for row in query_rows}
+    )
+    if (
+        heldout.get("image_keys") != expected_heldout_keys
+        or heldout.get("normalized_paths") != expected_heldout_paths
+        or heldout.get("relevant_category_ids") != expected_categories
+        or heldout.get("image_keys_sha256") != stable_digest(expected_heldout_keys)
+        or heldout.get("normalized_paths_sha256") != stable_digest(expected_heldout_paths)
+    ):
+        raise ValueError(
+            "Heldout manifest does not exactly match the ordered query_images in "
+            "logical_train/logical_test. Rerun split and corpus."
+        )
+    heldout_keys = set(expected_heldout_keys)
+    heldout_paths = set(expected_heldout_paths)
+    relevant_categories = set(expected_categories)
 
     sources.output_dir.mkdir(parents=True, exist_ok=True)
     staging_dir = Path(tempfile.mkdtemp(prefix=".corpus-stage-", dir=sources.output_dir))
@@ -1484,6 +1931,11 @@ def _build_corpus_impl(sources: PipelineSources) -> dict[str, Any]:
         test_rows = build_rl_rows(logical_test)
         _write_parquet(train_rows, staged_paths["train"])
         _write_parquet(test_rows, staged_paths["test"])
+        distribution = {
+            "train": _dataset_distribution(train_rows),
+            "test": _dataset_distribution(test_rows),
+            "overall": _dataset_distribution(train_rows + test_rows),
+        }
 
         reason_counts: Counter[str] = Counter()
         unresolvable_categories: Counter[str] = Counter()
@@ -1533,6 +1985,7 @@ def _build_corpus_impl(sources: PipelineSources) -> dict[str, Any]:
             "stage": "corpus",
             "created_at": utc_now(),
             "samples": {"train": len(train_rows), "test": len(test_rows)},
+            "distribution": distribution,
             "vision_candidates_before_validation": candidate_count,
             "vision_corpus_rows": vision_row_count,
             "heldout_image_count": len(heldout_keys),
@@ -1598,8 +2051,7 @@ def _build_corpus_impl(sources: PipelineSources) -> dict[str, Any]:
         staged_paths["build_manifest.json"] = staging_dir / "build_manifest.json"
         final_paths["build_report.json"] = sources.output_dir / "build_report.json"
         final_paths["build_manifest.json"] = sources.output_dir / "build_manifest.json"
-        for name, staged in staged_paths.items():
-            os.replace(staged, final_paths[name])
+        _publish_artifact_set(staged_paths, final_paths)
         return manifest
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -1745,7 +2197,6 @@ def build_sft(sources: PipelineSources) -> dict[str, Any]:
             validation_fraction=float(config.get("validation_fraction", 0.10)),
             seed=int(config.get("seed", sources.seed)),
             oracle_top_k=int(config.get("oracle_top_k", 3)),
-            image_index=1,
             max_tool_response_tokens=int(config.get("max_tool_response_tokens", 500)),
             fallback_wrapper_token_reserve=int(config.get("fallback_wrapper_token_reserve", 32)),
         ),

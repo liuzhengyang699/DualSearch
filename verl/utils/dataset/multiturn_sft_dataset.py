@@ -31,6 +31,107 @@ from verl.utils.tokenizer import hf_tokenizer, normalize_token_ids
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+DUAL_SEARCH_SFT_DATA_SOURCE = "dual_search_sft"
+DUAL_SEARCH_SFT_SCHEMA_VERSION = 2
+
+
+def _integer_value(value: Any) -> int | None:
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)) and np.isfinite(value) and float(value).is_integer():
+        return int(value)
+    return None
+
+
+def _validate_dual_search_sft_schema(
+    dataframe: pd.DataFrame,
+    *,
+    messages_column: str = "messages",
+    image_column: str = "images",
+    tools_column: str = "tools",
+) -> None:
+    """Reject legacy DualSearch SFT rows before rendering their conversations."""
+
+    if dataframe.empty or "data_source" not in dataframe.columns:
+        return
+    dual_search_mask = dataframe["data_source"] == DUAL_SEARCH_SFT_DATA_SOURCE
+    if not bool(dual_search_mask.any()):
+        return
+    required_columns = {
+        "schema_version",
+        "sample_id",
+        "parent_sample_id",
+        "source_image_index",
+        "image_key",
+        image_column,
+        messages_column,
+        tools_column,
+    }
+    missing_columns = sorted(required_columns.difference(dataframe.columns))
+    if missing_columns:
+        raise ValueError(
+            "Legacy DualSearch SFT data is incompatible with schema v2; "
+            f"missing columns {missing_columns}. Rerun the sft stage."
+        )
+
+    for index, row in dataframe.loc[dual_search_mask].iterrows():
+        if _integer_value(row["schema_version"]) != DUAL_SEARCH_SFT_SCHEMA_VERSION:
+            raise ValueError(
+                "Legacy DualSearch SFT data is incompatible with schema v2; "
+                f"schema_version must be 2 (invalid row index: {index}). "
+                "Rerun the sft stage."
+            )
+        sample_id = row["sample_id"]
+        parent_sample_id = row["parent_sample_id"]
+        image_key = row["image_key"]
+        source_image_index = _integer_value(row["source_image_index"])
+        if (
+            not isinstance(sample_id, str)
+            or not sample_id.strip()
+            or not isinstance(parent_sample_id, str)
+            or not parent_sample_id.strip()
+            or not isinstance(image_key, str)
+            or not image_key.strip()
+            or source_image_index is None
+            or source_image_index <= 0
+        ):
+            raise ValueError(
+                f"Malformed DualSearch SFT schema v2 row {index}: sample_id, "
+                "parent_sample_id, image_key, and positive source_image_index are required. "
+                "Rerun the sft stage."
+            )
+
+        images = normalize_arrow_value(row[image_column])
+        if not isinstance(images, list) or len(images) != 1:
+            raise ValueError(
+                f"Malformed DualSearch SFT schema v2 row {index}: exactly one image is required. "
+                "Rerun the sft stage."
+            )
+        physical_image = images[0]
+        if isinstance(physical_image, dict):
+            physical_image = physical_image.get("image")
+        if not isinstance(physical_image, str) or not physical_image.strip():
+            raise ValueError(
+                f"Malformed DualSearch SFT schema v2 row {index}: the child image path is empty. "
+                "Rerun the sft stage."
+            )
+
+        try:
+            messages = decode_message_tool_arguments(row[messages_column])
+            tools = decode_tools_column(row[tools_column])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Malformed DualSearch SFT schema v2 row {index}: {exc}. "
+                "Rerun the sft stage."
+            ) from exc
+        if not messages or not tools:
+            raise ValueError(
+                f"Malformed DualSearch SFT schema v2 row {index}: messages and tools "
+                "must be non-empty. Rerun the sft stage."
+            )
+
 
 def _is_null(value: Any) -> bool:
     if value is None:
@@ -197,6 +298,12 @@ class MultiTurnSFTDataset(Dataset):
         if not frames:
             raise ValueError("at least one SFT parquet file is required")
         self.dataframe = pd.concat(frames, ignore_index=True)
+        _validate_dual_search_sft_schema(
+            self.dataframe,
+            messages_column=self.messages_key,
+            image_column=self.image_key,
+            tools_column=self.tools_key,
+        )
         if self.messages_key not in self.dataframe.columns:
             raise KeyError(f"SFT dataset is missing {self.messages_key!r}")
         total = len(self.dataframe)

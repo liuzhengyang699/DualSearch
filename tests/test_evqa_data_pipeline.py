@@ -10,6 +10,8 @@ from unittest.mock import patch
 from PIL import Image
 
 from dual_search.data.evqa_pipeline import (
+    _publish_artifact_set,
+    _sample_id,
     build_catalog,
     build_corpus,
     build_split,
@@ -256,9 +258,53 @@ class SyntheticEVQAPipelineTest(unittest.TestCase):
         self.assertEqual(catalog_report["images"], 7)
 
         split_report = build_split(sources)
-        self.assertEqual(split_report["train_samples"], 3)
+        self.assertEqual(split_report["schema_version"], 2)
+        self.assertEqual(split_report["train_samples"], 2)
         self.assertEqual(split_report["test_samples"], 1)
         self.assertEqual(split_report["gldv2_rows_skipped"], 1)
+        self.assertEqual(
+            split_report["distribution"]["train"],
+            {
+                "rl_questions": 2,
+                "query_images": 3,
+                "single_image_questions": 1,
+                "multi_image_questions": 1,
+                "image_count_histogram": {"1": 1, "2": 1},
+                "by_question_type": {
+                    "single_hop": {"query_images": 3, "questions": 2}
+                },
+                "by_category": {
+                    "inaturalist:100": {"query_images": 2, "questions": 1},
+                    "inaturalist:200": {"query_images": 1, "questions": 1},
+                },
+            },
+        )
+        logical_train = [
+            json.loads(line)
+            for line in (self.output_dir / "logical_train.jsonl").read_text().splitlines()
+        ]
+        multi_logical = next(
+            row for row in logical_train if row["category_key"] == "inaturalist:100"
+        )
+        self.assertEqual(multi_logical["schema_version"], 2)
+        self.assertEqual(multi_logical["image_count"], 2)
+        self.assertEqual(multi_logical["image_keys"], ["inaturalist:1", "inaturalist:2"])
+        self.assertEqual(
+            [
+                (image["image_index"], image["dataset_image_id"])
+                for image in multi_logical["query_images"]
+            ],
+            [(1, "1"), (2, "2")],
+        )
+        for obsolete in (
+            "dataset_image_id",
+            "all_image_ids",
+            "image_key",
+            "image",
+            "source_file_name",
+            "source_split",
+        ):
+            self.assertNotIn(obsolete, multi_logical)
 
         manifest = build_corpus(sources)
         from dual_search.data.sft_builder import _extract_heldout_image_keys
@@ -277,11 +323,37 @@ class SyntheticEVQAPipelineTest(unittest.TestCase):
 
         train = pd.read_parquet(self.output_dir / "train.parquet")
         test = pd.read_parquet(self.output_dir / "test.parquet")
-        self.assertEqual(len(train), 3)
+        self.assertEqual(len(train), 2)
         self.assertEqual(len(test), 1)
-        self.assertEqual(sorted(train["positive_candidate_count"].tolist()), [0, 2, 2])
+        self.assertEqual(sorted(train["positive_candidate_count"].tolist()), [0, 2])
         self.assertEqual(train["retrieval_resolvable"].tolist().count(False), 1)
         self.assertTrue(bool(test.iloc[0]["retrieval_resolvable"]))
+        multi_rl = train.loc[train["category_key"] == "inaturalist:100"].iloc[0]
+        self.assertEqual(int(multi_rl["schema_version"]), 2)
+        self.assertEqual(multi_rl["dataset_category_id"], "100")
+        self.assertEqual(int(multi_rl["image_count"]), 2)
+        self.assertEqual(list(multi_rl["image_keys"]), ["inaturalist:1", "inaturalist:2"])
+        self.assertEqual(
+            [image["image_index"] for image in multi_rl["query_images"]],
+            [1, 2],
+        )
+        self.assertEqual(len(multi_rl["images"]), 2)
+        prompt = multi_rl["prompt"][0]["content"]
+        self.assertEqual(prompt.count("<image>"), 2)
+        self.assertLess(prompt.index("Image 1:\n<image>"), prompt.index("Image 2:\n<image>"))
+        self.assertIn("Images are numbered from 1", prompt)
+        self.assertEqual(
+            manifest["report"]["distribution"]["overall"]["rl_questions"], 3
+        )
+        self.assertEqual(
+            manifest["report"]["distribution"]["overall"]["query_images"], 4
+        )
+        self.assertEqual(
+            manifest["report"]["distribution"]["overall"]["retrieval_resolvable"], 2
+        )
+        self.assertEqual(
+            manifest["report"]["image_materialization"]["query_images"], 4
+        )
         self.assertEqual(
             manifest["report"]["image_materialization"]["dropped_candidates"][0]["image_key"],
             "inaturalist:12",
@@ -313,6 +385,159 @@ class SyntheticEVQAPipelineTest(unittest.TestCase):
         self.assertFalse((self.output_dir / "logical_test.jsonl").exists())
         preflight = json.loads((self.output_dir / "split_preflight_report.json").read_text())
         self.assertEqual(preflight["missing_queries"][0]["reason"], "found_only_in_wrong_split")
+
+    def test_duplicate_query_ids_are_deduplicated_without_reordering(self):
+        write_csv(self.train_csv, [evqa_row(dataset_image_ids="2|1|2")])
+        sources = load_sources(self.config_path)
+        build_catalog(sources)
+        build_split(sources)
+
+        logical = json.loads(
+            (self.output_dir / "logical_train.jsonl").read_text(encoding="utf-8").strip()
+        )
+        self.assertEqual(logical["image_keys"], ["inaturalist:2", "inaturalist:1"])
+        self.assertEqual(
+            [image["image_index"] for image in logical["query_images"]],
+            [1, 2],
+        )
+
+    def test_query_image_order_changes_parent_sample_id(self):
+        write_csv(self.train_csv, [evqa_row(dataset_image_ids="1|2")])
+        sources = load_sources(self.config_path)
+        build_catalog(sources)
+        build_split(sources)
+        first = json.loads(
+            (self.output_dir / "logical_train.jsonl").read_text(encoding="utf-8").strip()
+        )
+
+        write_csv(self.train_csv, [evqa_row(dataset_image_ids="2|1")])
+        build_split(sources)
+        second = json.loads(
+            (self.output_dir / "logical_train.jsonl").read_text(encoding="utf-8").strip()
+        )
+
+        self.assertNotEqual(first["sample_id"], second["sample_id"])
+        self.assertEqual(second["image_keys"], ["inaturalist:2", "inaturalist:1"])
+
+    def test_cross_category_query_images_fail_split_atomically(self):
+        write_csv(
+            self.train_csv,
+            [evqa_row(dataset_category_id="", dataset_image_ids="1|4")],
+        )
+        sources = load_sources(self.config_path)
+        build_catalog(sources)
+
+        with self.assertRaises(RuntimeError):
+            build_split(sources)
+
+        self.assertFalse((self.output_dir / "logical_train.jsonl").exists())
+        self.assertFalse((self.output_dir / "logical_test.jsonl").exists())
+        preflight = json.loads(
+            (self.output_dir / "split_preflight_report.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["category_mismatches"][0]["reason"],
+            "inconsistent_query_categories",
+        )
+
+    def test_corpus_rejects_v1_logical_rows(self):
+        sources = load_sources(self.config_path)
+        build_catalog(sources)
+        build_split(sources)
+        logical_path = self.output_dir / "logical_train.jsonl"
+        rows = [json.loads(line) for line in logical_path.read_text().splitlines()]
+        rows[0]["schema_version"] = 1
+        logical_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires schema_version=2"):
+            build_corpus(sources)
+
+        self.assertFalse((self.output_dir / "train.parquet").exists())
+        self.assertFalse((self.output_dir / "test.parquet").exists())
+        preflight = json.loads(
+            (self.output_dir / "corpus_preflight_report.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("Rerun catalog, split, corpus, and sft", preflight["error"])
+
+    def test_corpus_rejects_logical_heldout_mismatch_after_valid_fingerprint(self):
+        sources = load_sources(self.config_path)
+        build_catalog(sources)
+        build_split(sources)
+        logical_path = self.output_dir / "logical_train.jsonl"
+        rows = [json.loads(line) for line in logical_path.read_text().splitlines()]
+        multi = next(row for row in rows if row["image_count"] == 2)
+        single = next(row for row in rows if row["image_count"] == 1)
+        replacement = dict(single["query_images"][0])
+        replacement["image_index"] = 1
+        multi["query_images"][0] = replacement
+        multi["image_keys"][0] = replacement["image_key"]
+        multi["sample_id"] = _sample_id(
+            multi,
+            multi["official_split"],
+            multi["source_row_index"],
+            multi["image_keys"],
+        )
+        logical_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        split_report_path = self.output_dir / "split_report.json"
+        split_report = json.loads(split_report_path.read_text(encoding="utf-8"))
+        refreshed = corpus_fingerprint(logical_path)
+        refreshed["path"] = str(logical_path)
+        split_report["artifacts"]["logical_train"] = refreshed
+        split_report_path.write_text(
+            json.dumps(split_report),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Heldout manifest does not exactly match"):
+            build_corpus(sources)
+
+        self.assertFalse((self.output_dir / "train.parquet").exists())
+        self.assertFalse((self.output_dir / "test.parquet").exists())
+
+    def test_artifact_set_publish_restores_previous_generation_on_failure(self):
+        staged = {
+            "first": self.root / "staged-first.txt",
+            "commit": self.root / "staged-commit.txt",
+        }
+        final = {
+            "first": self.root / "first.txt",
+            "commit": self.root / "commit.txt",
+        }
+        for path, content in (
+            (staged["first"], "new-first"),
+            (staged["commit"], "new-commit"),
+            (final["first"], "old-first"),
+            (final["commit"], "old-commit"),
+        ):
+            path.write_text(content, encoding="utf-8")
+
+        real_replace = __import__("os").replace
+        published = 0
+
+        def fail_second_publish(source, destination):
+            nonlocal published
+            if Path(source) in set(staged.values()):
+                published += 1
+                if published == 2:
+                    raise OSError("simulated publish failure")
+            return real_replace(source, destination)
+
+        with patch(
+            "dual_search.data.evqa_pipeline.os.replace",
+            side_effect=fail_second_publish,
+        ), self.assertRaisesRegex(OSError, "simulated publish failure"):
+            _publish_artifact_set(staged, final)
+
+        self.assertEqual(final["first"].read_text(encoding="utf-8"), "old-first")
+        self.assertEqual(final["commit"].read_text(encoding="utf-8"), "old-commit")
+        self.assertFalse(list(self.root.glob(".*.backup")))
 
     def test_corpus_reordering_invalidates_fingerprint(self):
         corpus = self.root / "corpus.jsonl"
@@ -500,6 +725,11 @@ class SyntheticEVQAPipelineTest(unittest.TestCase):
         )
         self.assertEqual(preflight["error_type"], "RuntimeError")
         self.assertIn("corrupt_query_pixel", preflight["error"])
+        failure = json.loads(preflight["error"])["missing_query_images"][0]
+        self.assertTrue(failure["sample_id"].startswith("evqa:"))
+        self.assertEqual(failure["image_index"], 1)
+        self.assertEqual(failure["image_key"], "inaturalist:1")
+        self.assertEqual(Path(failure["path"]).name, "1.png")
 
     def test_missing_query_archive_member_fails_corpus_without_parquet(self):
         sources = load_sources(self.config_path)
@@ -523,6 +753,37 @@ class SyntheticEVQAPipelineTest(unittest.TestCase):
             (self.output_dir / "corpus_preflight_report.json").read_text(encoding="utf-8")
         )
         self.assertIn("missing_query_archive_member_or_file", preflight["error"])
+        failure = json.loads(preflight["error"])["missing_query_images"][0]
+        self.assertTrue(failure["sample_id"].startswith("evqa:"))
+        self.assertEqual(failure["image_index"], 1)
+        self.assertEqual(failure["image_key"], "inaturalist:1")
+
+    def test_corrupt_second_query_image_reports_parent_and_source_index(self):
+        sources = load_sources(self.config_path)
+        build_catalog(sources)
+        build_split(sources)
+        write_archive(
+            self.train_archive,
+            {
+                "train/1.png": image_bytes("red"),
+                "train/2.png": b"corrupt-second-query-pixel",
+                "train/3.png": image_bytes("blue"),
+                "train/4.png": image_bytes("yellow"),
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "corrupt_query_pixel"):
+            build_corpus(sources)
+
+        preflight = json.loads(
+            (self.output_dir / "corpus_preflight_report.json").read_text(encoding="utf-8")
+        )
+        failure = json.loads(preflight["error"])["missing_query_images"][0]
+        self.assertTrue(failure["sample_id"].startswith("evqa:"))
+        self.assertEqual(failure["image_index"], 2)
+        self.assertEqual(failure["image_key"], "inaturalist:2")
+        self.assertFalse((self.output_dir / "train.parquet").exists())
+        self.assertFalse((self.output_dir / "test.parquet").exists())
 
 
 if __name__ == "__main__":

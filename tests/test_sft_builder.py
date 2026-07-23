@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from dual_search.data.sft_builder import (
     TrajectoryBuildError,
     VLLMTeacherClient,
     _check_early_leak,
+    _sft_child_id,
     _stable_key,
     build_sft_files,
     build_sft_records,
@@ -51,12 +53,38 @@ class FakeTeacher:
         return {"think": "The retrieved evidence now supports a concise response", "answer": self.final_answer}
 
 
-def _record(sample_id, image_key, *, question_type="single_hop", resolvable=True):
+def _record(
+    sample_id,
+    image_key,
+    *,
+    question_type="single_hop",
+    resolvable=True,
+    image_paths=None,
+):
+    image_keys = [image_key] if isinstance(image_key, str) else list(image_key)
+    image_paths = list(image_paths) if image_paths is not None else [__file__] * len(image_keys)
+    assert len(image_paths) == len(image_keys)
+    query_images = [
+        {
+            "image_index": index,
+            "dataset_image_id": f"image-{index}-{key}",
+            "image_key": key,
+            "image": str(image_paths[index - 1]),
+            "source_file_name": f"train/{index}.jpg",
+            "source_split": "train",
+        }
+        for index, key in enumerate(image_keys, start=1)
+    ]
+    prompt_images = "\n".join(f"Image {index}:\n<image>" for index in range(1, len(image_keys) + 1))
     return {
+        "schema_version": 2,
         "data_source": "dual_search",
         "sample_id": sample_id,
-        "image_key": image_key,
+        "query_images": query_images,
+        "image_keys": image_keys,
+        "image_count": len(image_keys),
         "category_key": "inaturalist:cat-a",
+        "dataset_category_id": "cat-a",
         "question": "What habitat does the pictured animal prefer?",
         "question_type": question_type,
         "retrieval_resolvable": resolvable,
@@ -65,9 +93,13 @@ def _record(sample_id, image_key, *, question_type="single_hop", resolvable=True
         "wikipedia_title": ["Species Alpha"],
         "evidence_section_id": ["alpha-habitat"],
         "evidence": "It lives in cloud forests.",
-        "prompt": [{"role": "user", "content": "<image>\nQuestion: What habitat does it prefer?"}],
-        "images": [{"image": __file__}],
+        "prompt": [{"role": "user", "content": f"{prompt_images}\nQuestion: What habitat does it prefer?"}],
+        "images": [{"image": item["image"]} for item in query_images],
     }
+
+
+def _record_image_keys(record):
+    return set(record["image_keys"])
 
 
 def _vision_corpus():
@@ -123,14 +155,15 @@ def test_failed_teacher_sample_is_deterministically_supplemented():
     records = [_record("sample-a", "inaturalist:query-a"), _record("sample-b", "inaturalist:query-b")]
     ordered = sorted(
         records,
-        key=lambda row: _stable_key(7, "sft_candidate_group", "single_hop", row["image_key"]),
+        key=lambda row: _stable_key(7, "sft_candidate_group", "single_hop", row["image_keys"][0]),
     )
-    teacher = FakeTeacher(fail_sample_ids={ordered[0]["sample_id"]})
+    failed_child_id = _sft_child_id(ordered[0]["sample_id"], ordered[0]["image_keys"][0])
+    teacher = FakeTeacher(fail_sample_ids={failed_child_id})
     result = build_sft_records(
         records,
         _vision_corpus(),
         _text_corpus(),
-        {row["image_key"] for row in records},
+        set().union(*(_record_image_keys(row) for row in records)),
         teacher,
         SFTBuilderConfig(sample_fraction=0.05, validation_fraction=0.1, seed=7),
     )
@@ -156,9 +189,9 @@ def test_teacher_requests_carry_image_planning_gold_and_structured_tool_history(
         [record],
         _vision_corpus(),
         _text_corpus(),
-        {record["image_key"]},
+        _record_image_keys(record),
         teacher,
-        SFTBuilderConfig(sample_fraction=1, image_index=1),
+        SFTBuilderConfig(sample_fraction=1),
     )
     assert [call["stage"] for call in teacher.calls] == ["vision", "search", "answer"]
 
@@ -221,17 +254,181 @@ def test_teacher_requests_carry_image_planning_gold_and_structured_tool_history(
     assert "SecretAnswer" not in json.dumps(student_messages, ensure_ascii=False)
 
 
+def test_multi_image_parent_expands_to_stable_single_image_children(tmp_path):
+    image_paths = [tmp_path / f"query-{index}.jpg" for index in range(1, 4)]
+    for index, path in enumerate(image_paths, start=1):
+        path.write_bytes(f"query-image-{index}".encode())
+    parent = _record(
+        "parent-multi",
+        [
+            "inaturalist:query-multi-a",
+            "inaturalist:query-multi-b",
+            "inaturalist:query-multi-c",
+        ],
+        question_type="visual_attribute",
+        image_paths=image_paths,
+    )
+    heldout = _record_image_keys(parent)
+    first_teacher = FakeTeacher(search_query="pictured animal habitat facts")
+    first = build_sft_records(
+        [parent],
+        _vision_corpus(),
+        _text_corpus(),
+        heldout,
+        first_teacher,
+        SFTBuilderConfig(sample_fraction=1, validation_fraction=0, seed=3),
+    )
+    second = build_sft_records(
+        [parent],
+        _vision_corpus(),
+        _text_corpus(),
+        heldout,
+        FakeTeacher(search_query="pictured animal habitat facts"),
+        SFTBuilderConfig(sample_fraction=1, validation_fraction=0, seed=999),
+    )
+
+    assert len(first.train_rows) == 3
+    assert len({row["sample_id"] for row in first.train_rows}) == 3
+    assert {row["sample_id"] for row in first.train_rows} == {
+        row["sample_id"] for row in second.train_rows
+    }
+    assert {row["parent_sample_id"] for row in first.train_rows} == {"parent-multi"}
+    assert {row["source_image_index"] for row in first.train_rows} == {1, 2, 3}
+    assert {row["image_key"] for row in first.train_rows} == heldout
+    assert {
+        (row["source_image_index"], row["images"][0]["image"])
+        for row in first.train_rows
+    } == {
+        (index, str(path))
+        for index, path in enumerate(image_paths, start=1)
+    }
+    teacher_image_payloads = []
+    for call in first_teacher.calls:
+        image_item = next(
+            item
+            for message in call["messages"]
+            if isinstance(message.get("content"), list)
+            for item in message["content"]
+            if item.get("type") == "image_url"
+        )
+        data_url = image_item["image_url"]["url"]
+        teacher_image_payloads.append(base64.b64decode(data_url.split(",", 1)[1]))
+    assert {
+        payload for payload in teacher_image_payloads
+    } == {
+        path.read_bytes() for path in image_paths
+    }
+    assert len(teacher_image_payloads) == 3 * len(image_paths)
+    for row in first.train_rows:
+        assert row["schema_version"] == 2
+        assert len(row["images"]) == 1
+        assert row["messages"][0]["content"].count("<image>") == 1
+        assert "Image 2:" not in row["messages"][0]["content"]
+        arguments = json.loads(row["messages"][1]["tool_calls"][0]["function"]["arguments"])
+        assert arguments["image_index"] == 1
+        assert row["extra_info"]["parent_sample_id"] == "parent-multi"
+        assert row["extra_info"]["source_image_index"] == row["source_image_index"]
+
+    assert first.report["eligibility"]["eligible_parent_samples"] == 1
+    assert first.report["eligibility"]["expanded_single_image_candidates"] == 3
+    assert first.report["sampling"]["targets_by_question_type"] == {"visual_attribute": 3}
+    assert "image_index" not in first.report["config"]
+
+
+def test_sampling_fraction_uses_expanded_single_image_candidate_count():
+    image_keys = [f"inaturalist:expanded-{index}" for index in range(20)]
+    parent = _record("parent-expanded", image_keys, question_type="visual_attribute")
+    result = build_sft_records(
+        [parent],
+        _vision_corpus(),
+        _text_corpus(),
+        set(image_keys),
+        FakeTeacher(search_query="pictured animal habitat facts"),
+        SFTBuilderConfig(sample_fraction=0.05, validation_fraction=0, seed=23),
+    )
+
+    assert result.report["eligibility"]["eligible_parent_samples"] == 1
+    assert result.report["eligibility"]["expanded_single_image_candidates"] == 20
+    assert result.report["sampling"]["targets_by_question_type"] == {
+        "visual_attribute": 1
+    }
+    assert result.report["sampling"]["successful_by_question_type"] == {
+        "visual_attribute": 1
+    }
+    assert len(result.train_rows) == 1
+
+
+def test_multi_image_parent_rejects_misalignment_duplicates_and_missing_heldout():
+    aligned = _record(
+        "parent-aligned",
+        ["inaturalist:aligned-a", "inaturalist:aligned-b"],
+    )
+    misaligned = dict(aligned)
+    misaligned["image_keys"] = list(reversed(aligned["image_keys"]))
+    try:
+        build_sft_records(
+            [misaligned],
+            _vision_corpus(),
+            _text_corpus(),
+            _record_image_keys(aligned),
+            FakeTeacher(),
+        )
+    except ValueError as exc:
+        assert "inconsistent index, identity, path, or duplicate image_key" in str(exc)
+    else:
+        raise AssertionError("misaligned v2 image lists must be rejected")
+
+    duplicate = _record(
+        "parent-duplicate",
+        ["inaturalist:duplicate", "inaturalist:duplicate"],
+    )
+    try:
+        build_sft_records(
+            [duplicate],
+            _vision_corpus(),
+            _text_corpus(),
+            {"inaturalist:duplicate"},
+            FakeTeacher(),
+        )
+    except ValueError as exc:
+        assert "duplicate image_key" in str(exc)
+    else:
+        raise AssertionError("duplicate v2 image keys must be rejected")
+
+    try:
+        build_sft_records(
+            [aligned],
+            _vision_corpus(),
+            _text_corpus(),
+            {"inaturalist:aligned-a"},
+            FakeTeacher(),
+        )
+    except ValueError as exc:
+        assert "absent from the heldout manifest" in str(exc)
+        assert "inaturalist:aligned-b" in str(exc)
+    else:
+        raise AssertionError("every SFT child image must be present in heldout")
+
+
 def test_two_hop_and_unresolvable_rows_are_excluded_and_early_leak_is_rejected():
     records = [
-        _record("two-hop", "inaturalist:query-two", question_type="2_hop"),
-        _record("unresolvable", "inaturalist:query-unresolvable", resolvable=False),
+        _record(
+            "two-hop",
+            ["inaturalist:query-two-a", "inaturalist:query-two-b"],
+            question_type="2_hop",
+        ),
+        _record(
+            "unresolvable",
+            ["inaturalist:query-unresolvable-a", "inaturalist:query-unresolvable-b"],
+            resolvable=False,
+        ),
         _record("leaky", "inaturalist:query-leaky"),
     ]
     result = build_sft_records(
         records,
         _vision_corpus(),
         _text_corpus(),
-        {row["image_key"] for row in records},
+        set().union(*(_record_image_keys(row) for row in records)),
         FakeTeacher(leak=True),
         SFTBuilderConfig(sample_fraction=1, seed=3),
     )
@@ -272,7 +469,7 @@ def test_multi_hop_detection_supports_hop_type_and_multiple_page_schemas():
         [explicit, multiple_urls, multiple_pages],
         _vision_corpus(),
         _text_corpus(),
-        {row["image_key"] for row in [explicit, multiple_urls, multiple_pages]},
+        set().union(*(_record_image_keys(row) for row in [explicit, multiple_urls, multiple_pages])),
         FakeTeacher(search_query="pictured animal habitat facts"),
         SFTBuilderConfig(sample_fraction=1),
     )
@@ -389,7 +586,7 @@ def test_builder_observations_use_same_topk_format_then_token_truncation():
         [record],
         vision_corpus,
         text_corpus,
-        {record["image_key"]},
+        _record_image_keys(record),
         FakeTeacher(search_query="pictured animal habitat facts"),
         SFTBuilderConfig(sample_fraction=1, max_tool_response_tokens=120),
         observation_tokenizer=tokenizer,
@@ -425,7 +622,7 @@ def test_successful_rows_are_split_by_image_group():
         records,
         _vision_corpus(),
         _text_corpus(),
-        {row["image_key"] for row in records},
+        set().union(*(_record_image_keys(row) for row in records)),
         FakeTeacher(),
         SFTBuilderConfig(sample_fraction=1, validation_fraction=0.1, seed=11),
     )
@@ -434,6 +631,52 @@ def test_successful_rows_are_split_by_image_group():
     assert val_images
     assert train_images.isdisjoint(val_images)
     assert len(result.train_rows) + len(result.val_rows) == 12
+
+
+def test_validation_split_uses_connected_image_and_parent_groups():
+    records = [
+        _record("parent-a", ["inaturalist:shared", "inaturalist:a"]),
+        _record("parent-b", ["inaturalist:shared", "inaturalist:b"]),
+        _record("parent-c", "inaturalist:c"),
+        _record("parent-d", "inaturalist:d"),
+    ]
+    result = build_sft_records(
+        records,
+        _vision_corpus(),
+        _text_corpus(),
+        set().union(*(_record_image_keys(row) for row in records)),
+        FakeTeacher(),
+        SFTBuilderConfig(sample_fraction=1, validation_fraction=0.25, seed=17),
+    )
+    train_images = {row["image_key"] for row in result.train_rows}
+    val_images = {row["image_key"] for row in result.val_rows}
+    train_parents = {row["parent_sample_id"] for row in result.train_rows}
+    val_parents = {row["parent_sample_id"] for row in result.val_rows}
+    assert result.val_rows
+    assert train_images.isdisjoint(val_images)
+    assert train_parents.isdisjoint(val_parents)
+    assert ({"parent-a", "parent-b"} <= train_parents) or ({"parent-a", "parent-b"} <= val_parents)
+    assert result.report["output"]["image_group_overlap"] == 0
+    assert result.report["output"]["parent_group_overlap"] == 0
+
+
+def test_schema_v1_rl_rows_are_rejected_with_rebuild_instruction():
+    record = _record("legacy", "inaturalist:legacy")
+    record["schema_version"] = 1
+    try:
+        build_sft_records(
+            [record],
+            _vision_corpus(),
+            _text_corpus(),
+            _record_image_keys(record),
+            FakeTeacher(),
+        )
+    except ValueError as exc:
+        message = str(exc)
+        assert "schema v1" in message
+        assert "rerun split, corpus, and sft" in message
+    else:
+        raise AssertionError("schema v1 RL data must be rejected")
 
 
 def test_heldout_image_in_visual_corpus_is_a_hard_error():
@@ -472,7 +715,7 @@ def test_oracle_text_requires_the_exact_evidence_section():
         [record],
         _vision_corpus(),
         [wrong_section, *_text_corpus()[1:]],
-        {record["image_key"]},
+        _record_image_keys(record),
         FakeTeacher(),
         SFTBuilderConfig(sample_fraction=1),
     )
@@ -491,7 +734,18 @@ def test_parquet_roundtrip_preserves_json_arguments_and_group_split(tmp_path):
     text_path.write_text("".join(json.dumps(row) + "\n" for row in _text_corpus()), encoding="utf-8")
     manifest_path = tmp_path / "build_manifest.json"
     manifest_path.write_text(
-        json.dumps({"heldout": {"images": [{"image_key": row["image_key"]} for row in records]}}),
+        json.dumps(
+            {
+                "schema_version": 2,
+                "heldout": {
+                    "images": [
+                        {"image_key": image_key}
+                        for row in records
+                        for image_key in row["image_keys"]
+                    ]
+                },
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -531,7 +785,12 @@ def test_single_image_group_writes_a_loadable_empty_validation_schema(tmp_path):
     text_path.write_text("".join(json.dumps(row) + "\n" for row in _text_corpus()), encoding="utf-8")
     manifest_path = tmp_path / "build_manifest.json"
     manifest_path.write_text(
-        json.dumps({"heldout": {"heldout_image_keys": [record["image_key"]]}}),
+        json.dumps(
+            {
+                "schema_version": 2,
+                "heldout": {"heldout_image_keys": record["image_keys"]},
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -547,7 +806,52 @@ def test_single_image_group_writes_a_loadable_empty_validation_schema(tmp_path):
 
     empty_val = pd.read_parquet(tmp_path / "output" / "sft_val.parquet")
     assert len(empty_val) == 0
-    assert {"messages", "tools", "images", "sample_id", "image_key"}.issubset(empty_val.columns)
+    assert {
+        "schema_version",
+        "messages",
+        "tools",
+        "images",
+        "sample_id",
+        "parent_sample_id",
+        "source_image_index",
+        "image_key",
+    }.issubset(empty_val.columns)
+
+
+def test_schema_v1_manifest_is_rejected_before_sft_output(tmp_path):
+    record = _record("sample-legacy-manifest", "inaturalist:query-legacy-manifest")
+    train_path = tmp_path / "train.parquet"
+    pd.DataFrame([record]).to_parquet(train_path, index=False)
+    vision_path = tmp_path / "vision_corpus.jsonl"
+    vision_path.write_text("".join(json.dumps(row) + "\n" for row in _vision_corpus()), encoding="utf-8")
+    text_path = tmp_path / "text_corpus.jsonl"
+    text_path.write_text("".join(json.dumps(row) + "\n" for row in _text_corpus()), encoding="utf-8")
+    manifest_path = tmp_path / "build_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "heldout": {"heldout_image_keys": record["image_keys"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        build_sft_files(
+            train_parquet=train_path,
+            vision_corpus_path=vision_path,
+            text_corpus_path=text_path,
+            manifest_path=manifest_path,
+            output_dir=tmp_path / "output",
+            teacher=FakeTeacher(),
+        )
+    except ValueError as exc:
+        assert "schema v1" in str(exc)
+        assert "rerun split, corpus, and sft" in str(exc)
+    else:
+        raise AssertionError("schema v1 manifest must be rejected")
+    assert not (tmp_path / "output" / "sft_train.parquet").exists()
 
 
 class _Response:

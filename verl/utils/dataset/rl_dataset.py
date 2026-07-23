@@ -36,6 +36,176 @@ from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_to
 
 logger = logging.getLogger(__name__)
 
+DUAL_SEARCH_DATA_SOURCE = "dual_search"
+DUAL_SEARCH_RL_SCHEMA_VERSION = 2
+DUAL_SEARCH_QUERY_IMAGE_FIELDS = {
+    "image_index",
+    "dataset_image_id",
+    "image_key",
+    "image",
+    "source_file_name",
+    "source_split",
+}
+DUAL_SEARCH_OBSOLETE_IMAGE_FIELDS = {
+    "dataset_image_id",
+    "all_image_ids",
+    "image_key",
+    "image",
+    "source_file_name",
+    "source_split",
+}
+
+
+def _integer_value(value: Any) -> int | None:
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)) and np.isfinite(value) and float(value).is_integer():
+        return int(value)
+    return None
+
+
+def _plain_list(value: Any) -> list[Any] | None:
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    # Older datasets/Arrow combinations may expose a list<struct> as a
+    # struct-of-lists. Normalize that representation before validation.
+    if isinstance(value, dict) and value:
+        columns = {key: _plain_list(items) for key, items in value.items()}
+        if all(items is not None for items in columns.values()):
+            lengths = {len(items) for items in columns.values()}
+            if len(lengths) == 1:
+                return [
+                    {key: items[index] for key, items in columns.items()}
+                    for index in range(next(iter(lengths)))
+                ]
+    return None
+
+
+def _nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _physical_image_path(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("image")
+    return str(value or "").strip()
+
+
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, np.ndarray):
+        return value.size > 0
+    if isinstance(value, (list, tuple, dict)):
+        return len(value) > 0
+    return True
+
+
+def _validate_dual_search_rl_schema(
+    dataframe: datasets.Dataset,
+    *,
+    image_column: str = "images",
+) -> None:
+    """Reject legacy DualSearch rows before rollout can silently consume them."""
+
+    if not len(dataframe) or "data_source" not in dataframe.column_names:
+        return
+    data_sources = dataframe["data_source"]
+    dual_search_indices = [
+        index for index, data_source in enumerate(data_sources) if data_source == DUAL_SEARCH_DATA_SOURCE
+    ]
+    if not dual_search_indices:
+        return
+    required_columns = {
+        "schema_version",
+        "sample_id",
+        "category_key",
+        "dataset_category_id",
+        "query_images",
+        "image_keys",
+        "image_count",
+        image_column,
+    }
+    missing_columns = sorted(required_columns.difference(dataframe.column_names))
+    if missing_columns:
+        raise ValueError(
+            "Legacy DualSearch RL data is incompatible with the multi-image schema; "
+            f"missing columns {missing_columns}. Rerun split and corpus to produce schema v2."
+        )
+
+    for index in dual_search_indices:
+        row = dataframe[index]
+        if _integer_value(row.get("schema_version")) != DUAL_SEARCH_RL_SCHEMA_VERSION:
+            raise ValueError(
+                "Legacy DualSearch RL data is incompatible with the multi-image schema; "
+                f"schema_version must be 2 (invalid row index: {index}). "
+                "Rerun split and corpus."
+            )
+
+        obsolete_fields = sorted(
+            key
+            for key in DUAL_SEARCH_OBSOLETE_IMAGE_FIELDS
+            if key != image_column and key in row and _has_value(row.get(key))
+        )
+        if obsolete_fields:
+            raise ValueError(
+                f"Malformed DualSearch RL schema v2 row {index}: obsolete scalar image fields "
+                f"{obsolete_fields} are not allowed. Rerun split and corpus."
+            )
+
+        query_images = _plain_list(row.get("query_images"))
+        image_keys = _plain_list(row.get("image_keys"))
+        physical_images = _plain_list(row.get(image_column))
+        image_count = _integer_value(row.get("image_count"))
+        if (
+            not _nonempty_text(row.get("sample_id"))
+            or not _nonempty_text(row.get("category_key"))
+            or not _nonempty_text(row.get("dataset_category_id"))
+            or image_count is None
+            or image_count <= 0
+            or query_images is None
+            or image_keys is None
+            or physical_images is None
+            or len(query_images) != image_count
+            or len(image_keys) != image_count
+            or len(physical_images) != image_count
+        ):
+            raise ValueError(
+                f"Malformed DualSearch RL schema v2 row {index}: sample_id, shared category "
+                "identity, image_count, query_images, image_keys, and images must describe "
+                "the same non-empty ordered image list. Rerun split and corpus."
+            )
+
+        for position, (query_image, image_key, physical_image) in enumerate(
+            zip(query_images, image_keys, physical_images, strict=True),
+            start=1,
+        ):
+            if (
+                not isinstance(query_image, dict)
+                or set(query_image) != DUAL_SEARCH_QUERY_IMAGE_FIELDS
+                or _integer_value(query_image.get("image_index")) != position
+                or not _nonempty_text(query_image.get("dataset_image_id"))
+                or not _nonempty_text(query_image.get("image_key"))
+                or not _nonempty_text(query_image.get("image"))
+                or not _nonempty_text(query_image.get("source_file_name"))
+                or not _nonempty_text(query_image.get("source_split"))
+                or query_image["image_key"] != image_key
+                or query_image["image"] != _physical_image_path(physical_image)
+            ):
+                raise ValueError(
+                    f"Malformed DualSearch RL schema v2 row {index}: image position {position} "
+                    "has inconsistent identity, one-based index, or path. "
+                    "Rerun split and corpus."
+                )
+
 
 def collate_fn(data_list: list[dict]) -> dict:
     """
@@ -175,6 +345,7 @@ class RLHFDataset(Dataset):
                 raise ValueError(f"Unsupported file format: {parquet_file}")
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+        _validate_dual_search_rl_schema(self.dataframe, image_column=self.image_key)
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")

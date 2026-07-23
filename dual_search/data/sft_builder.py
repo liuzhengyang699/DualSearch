@@ -51,12 +51,17 @@ TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 MULTI_HOP_MARKERS = {"2", "2hop", "twohop", "multihop", "multiplehop"}
 DEFAULT_TOOL_RESPONSE_TOKENS = 500
 DEFAULT_TOOL_WRAPPER_TOKEN_RESERVE = 32
+SFT_SCHEMA_VERSION = 2
+RL_INPUT_SCHEMA_VERSION = 2
 SFT_PARQUET_COLUMNS = (
+    "schema_version",
     "data_source",
     "messages",
     "tools",
     "images",
     "sample_id",
+    "parent_sample_id",
+    "source_image_index",
     "image_key",
     "category_key",
     "question_type",
@@ -136,7 +141,6 @@ class SFTBuilderConfig:
     validation_fraction: float = 0.10
     seed: int = 42
     oracle_top_k: int = 3
-    image_index: int = 1
     data_source: str = "dual_search_sft"
     max_tool_response_tokens: int = DEFAULT_TOOL_RESPONSE_TOKENS
     fallback_wrapper_token_reserve: int = DEFAULT_TOOL_WRAPPER_TOKEN_RESERVE
@@ -148,8 +152,6 @@ class SFTBuilderConfig:
             raise ValueError("validation_fraction must be in [0, 1)")
         if self.oracle_top_k < 2:
             raise ValueError("oracle_top_k must be at least 2")
-        if self.image_index < 1:
-            raise ValueError("image_index must be one-based")
         if self.max_tool_response_tokens <= 0:
             raise ValueError("max_tool_response_tokens must be positive")
         if not 0 <= self.fallback_wrapper_token_reserve < self.max_tool_response_tokens:
@@ -444,13 +446,9 @@ def _gold_answers(record: Mapping[str, Any]) -> list[str]:
 
 
 def _student_prompt(record: Mapping[str, Any], question: str) -> str:
-    prompt = _plain(record.get("prompt"))
-    if isinstance(prompt, list):
-        for message in prompt:
-            if isinstance(message, Mapping) and message.get("role") == "user":
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content
+    # SFT children always contain exactly one image. Do not copy the parent
+    # RL prompt because a multi-image parent has numbered placeholders whose
+    # image_index semantics no longer apply after expansion.
     return (
         "<image>\nAnswer the question about the image. Use the provided tools when external visual "
         "or textual evidence is needed, call at most one tool in each assistant turn, reason inside "
@@ -644,7 +642,6 @@ def _teacher_messages(
     question: str,
     answers: Sequence[str],
     image_path: str,
-    image_index: int = 1,
     vision_observation: str | None = None,
     text_observation: str | None = None,
     vision_think: str | None = None,
@@ -734,7 +731,7 @@ def _teacher_messages(
         append_tool_history(
             think=str(vision_think),
             name="vision_search",
-            arguments={"image_index": image_index, "query": str(vision_query)},
+            arguments={"image_index": 1, "query": str(vision_query)},
             observation=str(vision_observation),
         )
     if stage == "answer":
@@ -1031,7 +1028,7 @@ def _build_trajectory(
     text_documents = _oracle_text_documents(record, text_corpus, config=config)
     vision_result_text = format_vision_results([{"document": doc} for doc in vision_documents])
     vision_observation = truncate_tool_observation(
-        f"image_index={config.image_index}:\n{vision_result_text}".rstrip(),
+        f"image_index=1:\n{vision_result_text}".rstrip(),
         tokenizer=observation_tokenizer,
         max_tokens=config.max_tool_response_tokens,
         fallback_wrapper_token_reserve=config.fallback_wrapper_token_reserve,
@@ -1057,7 +1054,6 @@ def _build_trajectory(
                 question=question,
                 answers=answers,
                 image_path=image_path,
-                image_index=config.image_index,
             ),
             response_schema=VISION_STAGE_SCHEMA,
         )
@@ -1068,7 +1064,7 @@ def _build_trajectory(
         vision_query = validate_tool_call_payload(
             {
                 "name": "vision_search",
-                "arguments": {"image_index": config.image_index, "query": vision_query},
+                "arguments": {"image_index": 1, "query": vision_query},
             },
             image_count=1,
         ).arguments["query"]
@@ -1090,7 +1086,6 @@ def _build_trajectory(
                 question=question,
                 answers=answers,
                 image_path=image_path,
-                image_index=config.image_index,
                 vision_observation=vision_observation,
                 vision_think=vision_think,
                 vision_query=vision_query,
@@ -1122,7 +1117,6 @@ def _build_trajectory(
                 question=question,
                 answers=answers,
                 image_path=image_path,
-                image_index=config.image_index,
                 vision_observation=vision_observation,
                 text_observation=text_observation,
                 vision_think=vision_think,
@@ -1142,7 +1136,7 @@ def _build_trajectory(
         _assistant_tool_message(
             think=vision_think,
             name="vision_search",
-            arguments={"image_index": config.image_index, "query": vision_query},
+            arguments={"image_index": 1, "query": vision_query},
         ),
         {"role": "tool", "name": "vision_search", "content": vision_observation},
         _assistant_tool_message(think=search_think, name="search", arguments={"query": search_query}),
@@ -1150,17 +1144,22 @@ def _build_trajectory(
         {"role": "assistant", "content": f"<think>{answer_think}</think>\n<answer>{final_answer}</answer>"},
     ]
     return {
+        "schema_version": SFT_SCHEMA_VERSION,
         "data_source": config.data_source,
         "messages": messages,
         "tools": canonical_tool_schemas_json(),
         "images": [{"image": image_path}],
         "sample_id": sample_id,
+        "parent_sample_id": str(_lookup(record, "parent_sample_id", "")).strip(),
+        "source_image_index": int(_lookup(record, "source_image_index", 0)),
         "image_key": image_key,
         "category_key": str(_lookup(record, "category_key", "")),
         "question_type": question_type,
         "retrieval_resolvable": True,
         "extra_info": {
             "sample_id": sample_id,
+            "parent_sample_id": str(_lookup(record, "parent_sample_id", "")).strip(),
+            "source_image_index": int(_lookup(record, "source_image_index", 0)),
             "image_key": image_key,
             "question_type": question_type,
             "source_data_source": record.get("data_source"),
@@ -1170,22 +1169,191 @@ def _build_trajectory(
     }
 
 
-def _eligible_records(records: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], Counter[str]]:
+_QUERY_IMAGE_KEYS = {
+    "image_index",
+    "dataset_image_id",
+    "image_key",
+    "image",
+    "source_file_name",
+    "source_split",
+}
+_LEGACY_REBUILD_MESSAGE = (
+    "RL training data schema v1 is incompatible with single-image SFT expansion; "
+    "rerun split, corpus, and sft to produce schema v2 artifacts"
+)
+
+
+def _schema_version(value: Any) -> int | None:
+    value = _plain(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _sft_child_id(parent_sample_id: str, image_key: str) -> str:
+    """Return a stable child identity independent of sampling configuration."""
+
+    identity = canonical_json(
+        {
+            "parent_sample_id": parent_sample_id,
+            "image_key": image_key,
+        }
+    )
+    return f"sft:{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _validated_query_images(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw_parent_sample_id = str(_lookup(record, "sample_id", "")).strip()
+    parent_sample_id = raw_parent_sample_id or "<missing>"
+    if _schema_version(_lookup(record, "schema_version")) != RL_INPUT_SCHEMA_VERSION:
+        raise ValueError(f"{_LEGACY_REBUILD_MESSAGE}: parent {parent_sample_id}")
+    for legacy_key in ("image_key", "dataset_image_id", "image", "source_file_name", "source_split"):
+        if legacy_key in record and not _is_missing(record.get(legacy_key)):
+            raise ValueError(
+                f"schema v2 RL parent {parent_sample_id} contains ambiguous scalar {legacy_key!r}; "
+                "rerun split, corpus, and sft"
+            )
+
+    raw_query_images = _as_list(_lookup(record, "query_images", []))
+    raw_image_keys = [str(value).strip() for value in _as_list(_lookup(record, "image_keys", []))]
+    raw_images = _as_list(record.get("images"))
+    image_count = _lookup(record, "image_count")
+    category_key = str(_lookup(record, "category_key", "")).strip()
+    dataset_category_id = str(_lookup(record, "dataset_category_id", "")).strip()
+    if (
+        not raw_parent_sample_id
+        or not category_key
+        or not dataset_category_id
+        or not raw_query_images
+        or _schema_version(image_count) != len(raw_query_images)
+        or len(raw_image_keys) != len(raw_query_images)
+        or len(raw_images) != len(raw_query_images)
+    ):
+        raise ValueError(
+            f"malformed schema v2 RL parent {parent_sample_id}: shared category identity, "
+            "query_images, image_keys, image_count, and images must describe the same "
+            "non-empty ordered image list"
+        )
+
+    query_images: list[dict[str, Any]] = []
+    seen_image_keys: set[str] = set()
+    for position, raw_query_image in enumerate(raw_query_images, start=1):
+        query_image = _plain(raw_query_image)
+        if not isinstance(query_image, Mapping) or set(query_image) != _QUERY_IMAGE_KEYS:
+            raise ValueError(
+                f"malformed schema v2 RL parent {parent_sample_id}: query_images[{position - 1}] "
+                f"must contain exactly {sorted(_QUERY_IMAGE_KEYS)}"
+            )
+        image_index = _schema_version(query_image.get("image_index"))
+        image_key = str(query_image.get("image_key") or "").strip()
+        image_path = str(query_image.get("image") or "").strip()
+        physical_image = _plain(raw_images[position - 1])
+        if isinstance(physical_image, Mapping):
+            physical_path = str(physical_image.get("image") or "").strip()
+        else:
+            physical_path = str(physical_image or "").strip()
+        required_strings = (
+            image_key,
+            image_path,
+            str(query_image.get("dataset_image_id") or "").strip(),
+            str(query_image.get("source_file_name") or "").strip(),
+            str(query_image.get("source_split") or "").strip(),
+        )
+        if (
+            image_index != position
+            or not all(required_strings)
+            or raw_image_keys[position - 1] != image_key
+            or physical_path != image_path
+            or image_key in seen_image_keys
+        ):
+            raise ValueError(
+                f"malformed schema v2 RL parent {parent_sample_id}: image position {position} "
+                "has inconsistent index, identity, path, or duplicate image_key"
+            )
+        seen_image_keys.add(image_key)
+        query_images.append(dict(query_image))
+
+    prompt = _plain(record.get("prompt")) or []
+    prompt_text = "".join(
+        str(message.get("content") or "")
+        for message in prompt
+        if isinstance(message, Mapping)
+    )
+    if prompt_text.count("<image>") != len(query_images):
+        raise ValueError(
+            f"malformed schema v2 RL parent {parent_sample_id}: prompt/image placeholder count mismatch"
+        )
+    return query_images
+
+
+def _single_image_child(
+    parent: Mapping[str, Any],
+    query_image: Mapping[str, Any],
+) -> dict[str, Any]:
+    parent_sample_id = str(_lookup(parent, "sample_id", "")).strip()
+    source_image_index = int(query_image["image_index"])
+    image_key = str(query_image["image_key"])
+    image_path = str(query_image["image"])
+    sample_id = _sft_child_id(parent_sample_id, image_key)
+    question = str(_lookup(parent, "question", "")).strip()
+
+    child = dict(_plain(parent))
+    child.update(
+        {
+            "schema_version": SFT_SCHEMA_VERSION,
+            "sample_id": sample_id,
+            "parent_sample_id": parent_sample_id,
+            "source_image_index": source_image_index,
+            "image_key": image_key,
+            "query_images": [{**dict(query_image), "image_index": 1}],
+            "image_keys": [image_key],
+            "image_count": 1,
+            "images": [{"image": image_path}],
+            "prompt": [{"role": "user", "content": _student_prompt({}, question)}],
+        }
+    )
+    extra_info = _plain(parent.get("extra_info")) or {}
+    if not isinstance(extra_info, Mapping):
+        extra_info = {}
+    child["extra_info"] = {
+        **dict(extra_info),
+        "schema_version": SFT_SCHEMA_VERSION,
+        "sample_id": sample_id,
+        "parent_sample_id": parent_sample_id,
+        "source_image_index": source_image_index,
+        "image_key": image_key,
+        "query_images": [{**dict(query_image), "image_index": 1}],
+        "image_keys": [image_key],
+        "image_count": 1,
+    }
+    return child
+
+
+def _eligible_records(
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], Counter[str], int, Counter[str]]:
     eligible: list[dict[str, Any]] = []
     excluded: Counter[str] = Counter()
+    eligible_parent_count = 0
+    eligible_parents_by_type: Counter[str] = Counter()
     for raw_record in records:
         record = dict(_plain(raw_record))
+        query_images = _validated_query_images(record)
         if is_multi_hop_record(record):
             excluded["two_hop"] += 1
             continue
         if _lookup(record, "retrieval_resolvable", False) is not True:
             excluded["retrieval_unresolvable"] += 1
             continue
-        if not str(_lookup(record, "image_key", "")).strip():
-            excluded["missing_image_key"] += 1
-            continue
-        eligible.append(record)
-    return eligible, excluded
+        eligible_parent_count += 1
+        question_type = str(_lookup(record, "question_type", ""))
+        eligible_parents_by_type[question_type] += 1
+        eligible.extend(_single_image_child(record, image) for image in query_images)
+    return eligible, excluded, eligible_parent_count, eligible_parents_by_type
 
 
 def _sample_targets(records: Sequence[Mapping[str, Any]], fraction: float) -> dict[str, int]:
@@ -1196,14 +1364,39 @@ def _sample_targets(records: Sequence[Mapping[str, Any]], fraction: float) -> di
     }
 
 
-def _grouped_train_val_split(
+def _connected_train_val_split(
     rows: Sequence[dict[str, Any]], validation_fraction: float, seed: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not rows or validation_fraction <= 0:
         return list(rows), []
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        groups[str(row["image_key"])].append(row)
+
+    parents = list(range(len(rows)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    seen_images: dict[str, int] = {}
+    seen_parents: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        for value, seen in (
+            (str(row["image_key"]), seen_images),
+            (str(row["parent_sample_id"]), seen_parents),
+        ):
+            previous = seen.setdefault(value, index)
+            union(index, previous)
+
+    groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        groups[find(index)].append(row)
     if len(groups) < 2:
         return list(rows), []
 
@@ -1212,32 +1405,49 @@ def _grouped_train_val_split(
         question_type: max(1, int(round(count * validation_fraction)))
         for question_type, count in by_type.items()
     }
-    val_keys: set[str] = set()
+    val_keys: set[int] = set()
     current: Counter[str] = Counter()
-    candidates = sorted(groups, key=lambda key: _stable_key(seed, "sft_val", key))
+    component_ids = {
+        key: canonical_json(
+            sorted(
+                (str(row["parent_sample_id"]), str(row["image_key"]), str(row["sample_id"]))
+                for row in component_rows
+            )
+        )
+        for key, component_rows in groups.items()
+    }
+    candidates = sorted(groups, key=lambda key: _stable_key(seed, "sft_val", component_ids[key]))
 
     while any(current[key] < desired[key] for key in desired) and len(val_keys) < len(groups) - 1:
-        best_key: str | None = None
+        best_key: int | None = None
         best_score: tuple[float, str] | None = None
-        for image_key in candidates:
-            if image_key in val_keys:
+        for component_key in candidates:
+            if component_key in val_keys:
                 continue
-            contribution = Counter(str(row["question_type"]) for row in groups[image_key])
+            contribution = Counter(str(row["question_type"]) for row in groups[component_key])
             gain = sum(min(contribution[key], max(0, desired[key] - current[key])) for key in desired)
             if gain <= 0:
                 continue
             overshoot = sum(max(0, current[key] + contribution[key] - desired[key]) for key in desired)
-            score = (gain - 0.01 * overshoot, _stable_key(seed, "sft_val_choice", image_key))
+            score = (
+                gain - 0.01 * overshoot,
+                _stable_key(seed, "sft_val_choice", component_ids[component_key]),
+            )
             if best_score is None or score > best_score:
                 best_score = score
-                best_key = image_key
+                best_key = component_key
         if best_key is None:
             break
         val_keys.add(best_key)
         current.update(str(row["question_type"]) for row in groups[best_key])
 
-    train_rows = [row for row in rows if str(row["image_key"]) not in val_keys]
-    val_rows = [row for row in rows if str(row["image_key"]) in val_keys]
+    val_sample_ids = {
+        str(row["sample_id"])
+        for component_key in val_keys
+        for row in groups[component_key]
+    }
+    train_rows = [row for row in rows if str(row["sample_id"]) not in val_sample_ids]
+    val_rows = [row for row in rows if str(row["sample_id"]) in val_sample_ids]
     train_rows.sort(key=lambda row: _stable_key(seed, "sft_train_order", row["sample_id"]))
     val_rows.sort(key=lambda row: _stable_key(seed, "sft_val_order", row["sample_id"]))
     return train_rows, val_rows
@@ -1267,7 +1477,19 @@ def build_sft_records(
     if leaked:
         raise ValueError(f"vision corpus contains held-out query images: {leaked[:5]}")
 
-    eligible, excluded = _eligible_records(train_records)
+    eligible, excluded, eligible_parent_count, eligible_parents_by_type = _eligible_records(train_records)
+    missing_heldout = sorted(
+        {
+            str(_lookup(record, "image_key", ""))
+            for record in eligible
+            if str(_lookup(record, "image_key", "")) not in heldout_image_keys
+        }
+    )
+    if missing_heldout:
+        raise ValueError(
+            "schema v2 RL query images are absent from the heldout manifest; "
+            f"rerun split, corpus, and sft: {missing_heldout[:5]}"
+        )
     targets = _sample_targets(eligible, config.sample_fraction)
     by_type: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for record in eligible:
@@ -1315,27 +1537,37 @@ def build_sft_records(
                 successes.append(trajectory)
                 success_counts[question_type] += 1
 
-    train_rows, val_rows = _grouped_train_val_split(successes, config.validation_fraction, config.seed)
+    train_rows, val_rows = _connected_train_val_split(
+        successes, config.validation_fraction, config.seed
+    )
     train_image_keys = {row["image_key"] for row in train_rows}
     val_image_keys = {row["image_key"] for row in val_rows}
+    train_parent_ids = {row["parent_sample_id"] for row in train_rows}
+    val_parent_ids = {row["parent_sample_id"] for row in val_rows}
     if train_image_keys & val_image_keys:
         raise AssertionError("SFT train/validation image groups overlap")
+    if train_parent_ids & val_parent_ids:
+        raise AssertionError("SFT train/validation parent question groups overlap")
 
     report = {
-        "schema_version": 1,
+        "schema_version": SFT_SCHEMA_VERSION,
         "config": asdict(config),
         "input": {
             "train_rows": len(train_records),
+            "rl_parent_samples": len(train_records),
             "vision_corpus_rows": len(vision_corpus),
             "text_corpus_rows": len(text_corpus),
             "heldout_image_keys": len(heldout_image_keys),
         },
         "eligibility": {
             "eligible": len(eligible),
+            "eligible_parent_samples": eligible_parent_count,
+            "expanded_single_image_candidates": len(eligible),
             "excluded": dict(sorted(excluded.items())),
             "eligible_by_question_type": dict(
                 sorted(Counter(str(_lookup(row, "question_type", "")) for row in eligible).items())
             ),
+            "eligible_parents_by_question_type": dict(sorted(eligible_parents_by_type.items())),
         },
         "sampling": {
             "targets_by_question_type": targets,
@@ -1359,7 +1591,10 @@ def build_sft_records(
             "sft_val": len(val_rows),
             "sft_train_image_groups": len(train_image_keys),
             "sft_val_image_groups": len(val_image_keys),
+            "sft_train_parent_groups": len(train_parent_ids),
+            "sft_val_parent_groups": len(val_parent_ids),
             "image_group_overlap": 0,
+            "parent_group_overlap": 0,
         },
         "observation_truncation": {
             "max_tokens_including_native_wrapper": config.max_tool_response_tokens,
@@ -1510,6 +1745,10 @@ def build_sft_files(
     manifest = _load_json(manifest_file)
     if not isinstance(manifest, Mapping):
         raise ValueError(f"build manifest is not a JSON object: {manifest_file}")
+    if _schema_version(manifest.get("schema_version")) != RL_INPUT_SCHEMA_VERSION:
+        raise ValueError(
+            f"{_LEGACY_REBUILD_MESSAGE}: manifest {manifest_file} is not schema v2"
+        )
     heldout_keys = _load_heldout_image_keys(manifest, manifest_file)
     if not heldout_keys:
         raise ValueError("manifest contains no held-out/query image keys; refusing to build SFT data")
