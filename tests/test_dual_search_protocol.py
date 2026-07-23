@@ -110,6 +110,54 @@ class DualSearchProtocolTest(unittest.TestCase):
         )
         self.assertTrue(validate_sequence(sequence)[0])
 
+    def test_sequence_accepts_exact_roles_left_by_qwen_special_token_decode(self):
+        sequence = (
+            VISION_ACTION
+            + "user\n<tool_response>Caption 1(Title: butterfly) copper wings</tool_response>"
+            + "assistant\n"
+            + SEARCH_ACTION
+            + "user\n<tool_response>Doc 1(Title: Bronze Copper) habitat evidence</tool_response>"
+            + "assistant\n"
+            + "<think>I can answer.</think><answer>Bronze Copper</answer>"
+        )
+        self.assertTrue(validate_sequence(sequence)[0])
+
+    def test_sequence_roles_are_only_accepted_at_exact_qwen_boundaries(self):
+        cases = [
+            (
+                VISION_ACTION
+                + "assistant\n<tool_response>caption</tool_response>"
+                + "<think>x</think><answer>done</answer>"
+            ),
+            (
+                VISION_ACTION
+                + "user:\n<tool_response>caption</tool_response>"
+                + "<think>x</think><answer>done</answer>"
+            ),
+            (
+                VISION_ACTION
+                + "<tool_response>caption</tool_response>"
+                + "user\n<think>x</think><answer>done</answer>"
+            ),
+            (
+                VISION_ACTION
+                + "<tool_response>caption</tool_response>"
+                + "assistant:\n<think>x</think><answer>done</answer>"
+            ),
+            "assistant\n<think>x</think><answer>done</answer>",
+        ]
+        for sequence in cases:
+            with self.subTest(sequence=sequence):
+                self.assertFalse(validate_sequence(sequence)[0])
+
+    def test_role_words_inside_tool_response_are_not_normalized(self):
+        sequence = (
+            SEARCH_ACTION
+            + "user\n<tool_response>The user asked an assistant for help.</tool_response>"
+            + "assistant\n<think>x</think><answer>assistant</answer>"
+        )
+        self.assertTrue(validate_sequence(sequence)[0])
+
     def test_sequence_rejects_missing_response_wrong_order_and_old_tags(self):
         invalid = [
             SEARCH_ACTION + "<think>x</think><answer>done</answer>",
