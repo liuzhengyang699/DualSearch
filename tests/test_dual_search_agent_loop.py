@@ -2,6 +2,8 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
+from PIL import Image
+
 from dual_search.llm_agent.dual_search_agent_loop import DualSearchAgentLoop
 from dual_search.protocol import DUAL_SEARCH_TOOL_SCHEMAS, parse_assistant_action
 
@@ -247,6 +249,82 @@ class DualSearchAgentLoopTest(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
+
+    async def test_vision_search_index_two_sends_second_processor_materialized_image(self):
+        first_image = Image.new("RGB", (2, 2), color=(255, 0, 0))
+        second_image = Image.new("RGB", (2, 2), color=(0, 0, 255))
+        agent = await self._make_agent(
+            [
+                tool_call("vision_search", {"image_index": 2, "query": "blue specimen"}),
+                "<think>done</think><answer>answer</answer>",
+            ],
+            max_turns=1,
+            raw_images=[first_image, second_image],
+        )
+        requests = []
+
+        async def batch_vision_search(items):
+            requests.extend(items)
+            return [[]]
+
+        agent._batch_vision_search = batch_vision_search
+        await agent.run(
+            sampling_params={},
+            raw_prompt=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "/raw/first.jpg"},
+                        {"type": "image", "image": "/raw/second.jpg"},
+                        {"type": "text", "text": "question"},
+                    ],
+                }
+            ],
+        )
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["query"], "blue specimen")
+        self.assertEqual(requests[0]["image_index"], 2)
+        self.assertEqual(requests[0]["image"], agent._jsonable_image(second_image))
+        self.assertNotEqual(requests[0]["image"], agent._jsonable_image(first_image))
+
+    async def test_out_of_range_vision_index_consumes_attempt_without_execution(self):
+        agent = await self._make_agent(
+            [
+                tool_call("vision_search", {"image_index": 3, "query": "specimen"}),
+                "<think>done</think><answer>answer</answer>",
+            ],
+            max_turns=1,
+            raw_images=["/processed/first.jpg", "/processed/second.jpg"],
+        )
+        requests = []
+
+        async def batch_vision_search(items):
+            requests.extend(items)
+            return [[]]
+
+        agent._batch_vision_search = batch_vision_search
+        output = await agent.run(
+            sampling_params={},
+            raw_prompt=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "/raw/first.jpg"},
+                        {"type": "image", "image": "/raw/second.jpg"},
+                        {"type": "text", "text": "question"},
+                    ],
+                }
+            ],
+        )
+        response_text = agent.tokenizer.decode(output.response_ids)
+
+        self.assertEqual(requests, [])
+        self.assertIn("image_index 3 is out of range for 2 input images", response_text)
+        self.assertEqual(output.extra_fields["tool_attempt_stats"], 1)
+        self.assertEqual(output.extra_fields["invalid_tool_call_stats"], 1)
+        self.assertEqual(output.extra_fields["tool_execution_failure_stats"], 0)
+        self.assertEqual(output.extra_fields["valid_vision_search_stats"], 0)
 
     async def test_action_truncation_keeps_original_token_logprob_alignment(self):
         action = "<think>done</think><answer>final</answer>"

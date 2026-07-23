@@ -6,6 +6,7 @@ import torch
 from dual_search.protocol import canonical_tool_schemas_json
 from verl.utils.dataset.multiturn_sft_dataset import (
     MultiTurnSFTDataset,
+    _validate_dual_search_sft_schema,
     decode_message_tool_arguments,
     normalize_arrow_value,
     optional_bool,
@@ -97,6 +98,22 @@ def _messages():
     ]
 
 
+def _dual_search_sft_row(**overrides):
+    row = {
+        "schema_version": 2,
+        "data_source": "dual_search_sft",
+        "messages": _messages(),
+        "tools": canonical_tool_schemas_json(),
+        "images": [{"image": __file__}],
+        "sample_id": "sft:child",
+        "parent_sample_id": "evqa:parent",
+        "source_image_index": 2,
+        "image_key": "inaturalist:query-2",
+    }
+    row.update(overrides)
+    return row
+
+
 def test_arrow_null_members_are_removed_recursively():
     value = {
         "role": "user",
@@ -160,3 +177,87 @@ def test_loader_accepts_an_empty_validation_file_with_fixed_columns(tmp_path):
         config={"pad_mode": "no_padding", "max_length": 8192, "truncation": "error"},
     )
     assert len(dataset) == 0
+
+
+def test_loader_rejects_legacy_dual_search_sft_schema():
+    legacy = pd.DataFrame([_dual_search_sft_row(schema_version=1)])
+
+    try:
+        _validate_dual_search_sft_schema(legacy)
+    except ValueError as exc:
+        assert "schema_version must be 2" in str(exc)
+        assert "Rerun the sft stage" in str(exc)
+    else:
+        raise AssertionError("legacy DualSearch SFT rows must be rejected")
+
+
+def test_loader_accepts_valid_v2_after_mixed_dataframe_float_promotion():
+    dual_search = pd.DataFrame([_dual_search_sft_row()])
+    ordinary = pd.DataFrame(
+        [
+            {
+                "data_source": "other_sft",
+                "messages": [],
+                "tools": "[]",
+                "images": [],
+            }
+        ]
+    )
+    mixed = pd.concat([dual_search, ordinary], ignore_index=True)
+
+    assert float(mixed.loc[0, "schema_version"]) == 2.0
+    _validate_dual_search_sft_schema(mixed)
+
+
+def test_dataset_init_accepts_valid_v2_single_image_parquet(tmp_path):
+    path = tmp_path / "valid_sft_v2.parquet"
+    pd.DataFrame([_dual_search_sft_row()]).to_parquet(path, index=False)
+
+    dataset = MultiTurnSFTDataset(
+        parquet_files=str(path),
+        tokenizer=FakeQwenTokenizer(),
+        processor=None,
+        config={"pad_mode": "no_padding", "max_length": 8192, "truncation": "error"},
+    )
+
+    assert len(dataset) == 1
+
+
+def test_loader_rejects_malformed_v2_single_image_child():
+    malformed = pd.DataFrame(
+        [
+            _dual_search_sft_row(
+                parent_sample_id="",
+                images=[
+                    {"image": "/tmp/first.jpg"},
+                    {"image": "/tmp/second.jpg"},
+                ],
+            )
+        ]
+    )
+
+    try:
+        _validate_dual_search_sft_schema(malformed)
+    except ValueError as exc:
+        assert "Malformed DualSearch SFT schema v2" in str(exc)
+        assert "Rerun the sft stage" in str(exc)
+    else:
+        raise AssertionError("malformed schema v2 SFT rows must be rejected")
+
+
+def test_dataset_init_rejects_v1_before_rendering(tmp_path):
+    path = tmp_path / "legacy_sft.parquet"
+    pd.DataFrame([_dual_search_sft_row(schema_version=1)]).to_parquet(path, index=False)
+
+    try:
+        MultiTurnSFTDataset(
+            parquet_files=str(path),
+            tokenizer=FakeQwenTokenizer(),
+            processor=None,
+            config={"pad_mode": "no_padding", "max_length": 8192, "truncation": "error"},
+        )
+    except ValueError as exc:
+        assert "schema_version must be 2" in str(exc)
+        assert "Rerun the sft stage" in str(exc)
+    else:
+        raise AssertionError("MultiTurnSFTDataset must reject v1 before rendering")
