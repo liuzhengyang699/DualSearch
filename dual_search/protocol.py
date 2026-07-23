@@ -317,6 +317,12 @@ _THINK_AT_RE = re.compile(r"\s*<think>(.*?)</think>\s*", re.DOTALL)
 _TOOL_AT_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>\s*", re.DOTALL)
 _TOOL_RESPONSE_AT_RE = re.compile(r"<tool_response>(.*?)</tool_response>\s*", re.DOTALL)
 _ANSWER_AT_RE = re.compile(r"<answer>(.*?)</answer>\s*", re.DOTALL)
+# Qwen's chat template renders tool observations as a ``user`` turn and emits
+# the next generation prefix as an ``assistant`` turn.  Decoding with
+# ``skip_special_tokens=True`` removes the surrounding ``<|im_*|>`` tokens but
+# intentionally leaves these two exact, newline-terminated role names behind.
+_QWEN_TOOL_RESPONSE_ROLE = "user\n"
+_QWEN_ASSISTANT_GENERATION_ROLE = "assistant\n"
 
 
 def validate_sequence(text: str) -> tuple[bool, str]:
@@ -342,12 +348,23 @@ def validate_sequence(text: str) -> tuple[bool, str]:
             except ProtocolError as exc:
                 return False, f"invalid tool call: {exc}"
             cursor = tool.end()
+            # Consume the decoded Qwen role only at the structural transition
+            # from an assistant tool call to its tool response.  In particular,
+            # do not normalize role words globally: retrieval content may
+            # legitimately contain either ``user`` or ``assistant``.
+            if text.startswith(_QWEN_TOOL_RESPONSE_ROLE, cursor):
+                cursor += len(_QWEN_TOOL_RESPONSE_ROLE)
             response = _TOOL_RESPONSE_AT_RE.match(text, cursor)
             if response is None:
                 return False, f"expected tool_response after tool call at offset {cursor}"
             if _PROTOCOL_CONTROL_RE.search(response.group(1)):
                 return False, "tool_response contains an unescaped protocol control tag"
             cursor = response.end()
+            # Likewise, the decoded generation-prefix role is legal only after
+            # a complete tool response and immediately before the next
+            # assistant turn parsed by the loop.
+            if text.startswith(_QWEN_ASSISTANT_GENERATION_ROLE, cursor):
+                cursor += len(_QWEN_ASSISTANT_GENERATION_ROLE)
             tool_calls += 1
             continue
 

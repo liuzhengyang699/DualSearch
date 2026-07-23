@@ -194,7 +194,7 @@ async def compute_score(
     retrieval_penalty = compute_retrieval_penalty(retrieval_call_count)
 
     failure = {
-        "score": 0.0,
+        "score": compute_total_reward(0.0, format_valid, retrieval_call_count),
         "judge_score": 0.0,
         "format_score": float(format_valid),
         "judge_valid": 0.0,

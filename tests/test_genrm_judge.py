@@ -97,7 +97,7 @@ class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
             "Candidate answer: Bronze Copper",
         )
 
-    async def test_noncompliant_output_returns_zero(self):
+    async def test_noncompliant_output_only_zeroes_answer_reward(self):
         with patch.object(
             genrm_judge,
             "request_genrm",
@@ -113,12 +113,14 @@ class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
                 extra_info={"valid_search_stats": 4, "valid_vision_search_stats": 4},
             )
 
-        self.assertEqual(result["score"], 0.0)
+        self.assertAlmostEqual(result["score"], -0.52)
+        self.assertEqual(result["judge_score"], 0.0)
+        self.assertEqual(result["format_score"], 1.0)
         self.assertEqual(result["judge_valid"], 0.0)
         self.assertEqual(result["retrieval_call_count"], 8.0)
         self.assertAlmostEqual(result["retrieval_penalty"], 0.72)
 
-    async def test_request_failure_returns_zero(self):
+    async def test_request_failure_only_zeroes_answer_reward(self):
         with patch.object(
             genrm_judge,
             "request_genrm",
@@ -133,8 +135,64 @@ class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
                 genrm_model="/models/small-genrm",
             )
 
-        self.assertEqual(result["score"], 0.0)
+        self.assertEqual(result["score"], 0.2)
+        self.assertEqual(result["judge_score"], 0.0)
+        self.assertEqual(result["format_score"], 1.0)
         self.assertEqual(result["judge_valid"], 0.0)
+
+    async def test_missing_answer_keeps_retrieval_penalty(self):
+        with patch.object(genrm_judge, "request_genrm", new=AsyncMock()) as request_mock:
+            result = await genrm_judge.compute_score(
+                data_source="dual_search",
+                solution_str="<think>no final answer</think>",
+                ground_truth=GROUND_TRUTH,
+                raw_prompt=RAW_PROMPT,
+                reward_router_address="127.0.0.1:9000",
+                genrm_model="/models/small-genrm",
+                extra_info={"valid_search_stats": 4},
+            )
+
+        self.assertAlmostEqual(result["score"], -0.08)
+        self.assertEqual(result["judge_score"], 0.0)
+        self.assertEqual(result["format_score"], 0.0)
+        self.assertEqual(result["judge_valid"], 0.0)
+        self.assertEqual(result["retrieval_call_count"], 4.0)
+        self.assertAlmostEqual(result["retrieval_penalty"], 0.08)
+        request_mock.assert_not_awaited()
+
+    async def test_missing_question_keeps_format_reward(self):
+        with patch.object(genrm_judge, "request_genrm", new=AsyncMock()) as request_mock:
+            result = await genrm_judge.compute_score(
+                data_source="dual_search",
+                solution_str=VALID_SOLUTION,
+                ground_truth=GROUND_TRUTH,
+                raw_prompt=[],
+                reward_router_address="127.0.0.1:9000",
+                genrm_model="/models/small-genrm",
+            )
+
+        self.assertEqual(result["score"], 0.2)
+        self.assertEqual(result["judge_score"], 0.0)
+        self.assertEqual(result["format_score"], 1.0)
+        self.assertEqual(result["judge_valid"], 0.0)
+        request_mock.assert_not_awaited()
+
+    async def test_missing_reference_keeps_format_reward(self):
+        with patch.object(genrm_judge, "request_genrm", new=AsyncMock()) as request_mock:
+            result = await genrm_judge.compute_score(
+                data_source="dual_search",
+                solution_str=VALID_SOLUTION,
+                ground_truth={"target": []},
+                raw_prompt=RAW_PROMPT,
+                reward_router_address="127.0.0.1:9000",
+                genrm_model="/models/small-genrm",
+            )
+
+        self.assertEqual(result["score"], 0.2)
+        self.assertEqual(result["judge_score"], 0.0)
+        self.assertEqual(result["format_score"], 1.0)
+        self.assertEqual(result["judge_valid"], 0.0)
+        request_mock.assert_not_awaited()
 
     async def test_valid_incorrect_judgement_keeps_format_reward(self):
         with patch.object(
