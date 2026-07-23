@@ -10,6 +10,15 @@ from verl.experimental.reward_loop.reward_manager.naive import NaiveRewardManage
 
 
 VALID_SOLUTION = "<think>identify the entity</think><answer>Bronze Copper</answer>"
+VALID_TOOL_SOLUTION = (
+    '<think>identify the entity</think><tool_call>{"name":"vision_search",'
+    '"arguments":{"image_index":1,"query":"butterfly visual similarity"}}</tool_call>'
+    '<tool_response>Caption 1(Title: Bronze Copper) a butterfly</tool_response>'
+    '<think>look up the name</think><tool_call>{"name":"search",'
+    '"arguments":{"query":"Bronze Copper common name"}}</tool_call>'
+    '<tool_response>Doc 1(Title: Bronze Copper) Bronze Copper</tool_response>'
+    '<think>answer</think><answer>Bronze Copper</answer>'
+)
 RAW_PROMPT = [
     {
         "role": "user",
@@ -20,6 +29,18 @@ GROUND_TRUTH = {"target": ["Bronze Copper"]}
 
 
 class GenRMJudgeTest(unittest.IsolatedAsyncioTestCase):
+    def test_project_validator_accepts_native_tool_trajectory(self):
+        valid, _ = genrm_judge.is_valid_sequence(VALID_TOOL_SOLUTION)
+        self.assertTrue(valid)
+
+    def test_project_validator_rejects_legacy_xml_actions(self):
+        legacy = (
+            "<think>search</think><search>query</search><information>result</information>"
+            "<think>answer</think><answer>Bronze Copper</answer>"
+        )
+        valid, _ = genrm_judge.is_valid_sequence(legacy)
+        self.assertFalse(valid)
+
     def test_extract_question_from_multimodal_prompt(self):
         raw_prompt = [
             {

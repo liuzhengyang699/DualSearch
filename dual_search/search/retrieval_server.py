@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--index_path", type=str, required=True, help="Path to bge_m3_Flat.index.")
     parser.add_argument("--bm25_path", type=str, default=None, help="Path to bm25_rank_bm25.pkl.")
     parser.add_argument("--corpus_path", type=str, required=True, help="EVQA text corpus JSONL.")
+    parser.add_argument("--meta_path", type=str, default=None, help="Index metadata used to validate the corpus fingerprint.")
     parser.add_argument("--retriever_model", type=str, default=DEFAULT_BGE_M3_MODEL)
     parser.add_argument("--reranker_model", type=str, default=DEFAULT_BGE_RERANKER_MODEL)
     parser.add_argument("--device", type=str, default=None)
@@ -87,6 +88,7 @@ def main():
         index_path=args.index_path,
         bm25_path=bm25_path,
         corpus_path=args.corpus_path,
+        meta_path=args.meta_path,
         dense_model_path=args.retriever_model,
         reranker_model_path=args.reranker_model,
         device=args.device,

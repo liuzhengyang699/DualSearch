@@ -8,6 +8,8 @@ from typing import Any, Sequence
 import faiss
 import numpy as np
 
+from dual_search.data.fingerprints import canonical_model_reference, load_and_validate_index_meta
+
 
 DEFAULT_BGE_M3_MODEL = "BAAI/bge-m3"
 DEFAULT_BGE_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -225,6 +227,7 @@ class HybridRetrieverConfig:
     index_path: str
     bm25_path: str
     corpus_path: str
+    meta_path: str | None = None
     dense_model_path: str = DEFAULT_BGE_M3_MODEL
     reranker_model_path: str = DEFAULT_BGE_RERANKER_MODEL
     device: str | None = None
@@ -245,13 +248,39 @@ class HybridRetriever:
     def __init__(self, config: HybridRetrieverConfig):
         self.config = config
         self.corpus = load_jsonl_corpus(config.corpus_path)
+        meta_path = config.meta_path or str(Path(config.index_path).parent / DEFAULT_META_NAME)
+        expected_encoder_config = {
+            "encoder": "BGEM3DenseEncoder",
+            "model_reference": canonical_model_reference(config.dense_model_path),
+            "normalize_embeddings": True,
+            "max_length": int(config.dense_max_length),
+            "use_fp16": bool(config.use_fp16),
+            "input_mode": "text",
+        }
+        self.index_meta = load_and_validate_index_meta(
+            meta_path,
+            config.corpus_path,
+            expected_kind="text",
+            id_keys=("id",),
+            expected_encoder_config=expected_encoder_config,
+        )
         self.index = faiss.read_index(config.index_path)
+        if int(self.index.ntotal) != len(self.corpus):
+            raise ValueError(
+                f"Dense index contains {self.index.ntotal} vectors for a "
+                f"{len(self.corpus)}-row corpus. Rebuild the index."
+            )
         if config.faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
             co.shard = True
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
         self.bm25 = RankBM25Index.load(config.bm25_path)
+        if self.bm25.corpus_size != len(self.corpus):
+            raise ValueError(
+                f"BM25 index contains {self.bm25.corpus_size} rows for a "
+                f"{len(self.corpus)}-row corpus. Rebuild the index."
+            )
         self.encoder = BGEM3DenseEncoder(
             model_path=config.dense_model_path,
             device=config.device,

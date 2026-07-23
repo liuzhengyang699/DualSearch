@@ -4,7 +4,7 @@ from typing import Any
 
 import aiohttp
 
-from verl.utils.reward_score.qa_em_format import extract_solution, is_valid_sequence
+from dual_search.reward.format_validator import extract_solution, is_valid_sequence
 
 
 SYSTEM_PROMPT = (

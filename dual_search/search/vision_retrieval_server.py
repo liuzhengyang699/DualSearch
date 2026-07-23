@@ -1,12 +1,15 @@
 import argparse
 import warnings
+from pathlib import Path
 from typing import Any, List, Optional
 
 import faiss
 import torch
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, conint, constr
 from tqdm import tqdm
+
+from dual_search.data.fingerprints import canonical_model_reference, load_and_validate_index_meta
 
 try:
     from dual_search.search.vision_retrieval import (
@@ -24,8 +27,8 @@ except ModuleNotFoundError:
 
 class VisionSearchQuery(BaseModel):
     sample_index: Optional[int] = None
-    query: Optional[str] = None
-    image_index: Optional[int] = None
+    query: constr(strip_whitespace=True, min_length=1)
+    image_index: conint(strict=True, ge=1)
     image: Any
     images: Optional[List[Any]] = None
 
@@ -48,6 +51,7 @@ class Config:
         device: Optional[str] = None,
         normalize_embeddings: bool = True,
         truncate_dim: Optional[int] = None,
+        meta_path: Optional[str] = None,
     ):
         self.retrieval_topk = retrieval_topk
         self.index_path = index_path
@@ -58,6 +62,7 @@ class Config:
         self.device = device
         self.normalize_embeddings = normalize_embeddings
         self.truncate_dim = truncate_dim
+        self.meta_path = meta_path
 
 
 class VisionDenseRetriever:
@@ -65,6 +70,22 @@ class VisionDenseRetriever:
         self.config = config
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
+        meta_path = config.meta_path or str(Path(config.index_path).parent / "vision_index_meta.json")
+        expected_encoder_config = {
+            "encoder": "Qwen3VLImageEncoder",
+            "model_reference": canonical_model_reference(config.retrieval_model_path),
+            "normalize_embeddings": bool(config.normalize_embeddings),
+            "truncate_dim": config.truncate_dim,
+            "corpus_input_mode": "image_only",
+            "query_input_mode": "image_text_joint",
+        }
+        self.index_meta = load_and_validate_index_meta(
+            meta_path,
+            config.corpus_path,
+            expected_kind="vision",
+            id_keys=("id", "image_key"),
+            expected_encoder_config=expected_encoder_config,
+        )
         self.index = faiss.read_index(config.index_path)
         if config.faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
@@ -73,6 +94,11 @@ class VisionDenseRetriever:
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
         self.corpus = load_corpus(config.corpus_path)
+        if int(self.index.ntotal) != len(self.corpus):
+            raise ValueError(
+                f"Vision index contains {self.index.ntotal} vectors for a "
+                f"{len(self.corpus)}-row corpus. Rebuild the index."
+            )
         self.encoder = Qwen3VLImageEncoder(
             model_path=config.retrieval_model_path,
             batch_size=config.retrieval_batch_size,
@@ -84,7 +110,7 @@ class VisionDenseRetriever:
     def _search(self, query: VisionSearchQuery, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
-        query_emb = self.encoder.encode([query.image])
+        query_emb = self.encoder.encode([{"image": query.image, "text": query.query}])
         scores, idxs = self.index.search(query_emb, k=num)
         docs, item_scores = self._load_scored_docs(idxs[0], scores[0])
         if return_score:
@@ -111,8 +137,8 @@ class VisionDenseRetriever:
             desc="Vision retrieval process: ",
         ):
             query_batch = query_list[start_idx:start_idx + self.batch_size]
-            image_batch = [query.image for query in query_batch]
-            batch_emb = self.encoder.encode(image_batch)
+            query_inputs = [{"image": query.image, "text": query.query} for query in query_batch]
+            batch_emb = self.encoder.encode(query_inputs)
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
 
             for item_idxs, item_scores in zip(batch_idxs, batch_scores):
@@ -120,7 +146,7 @@ class VisionDenseRetriever:
                 results.append(item_docs)
                 scores.append(valid_scores)
 
-            del batch_emb, batch_scores, batch_idxs, query_batch, image_batch
+            del batch_emb, batch_scores, batch_idxs, query_batch, query_inputs
             torch.cuda.empty_cache()
 
         if return_score:
@@ -161,8 +187,8 @@ app = FastAPI()
 @app.post("/vision_retrieve")
 def vision_retrieve_endpoint(request: VisionQueryRequest):
     """
-    Endpoint that accepts agent vision_search requests and performs image retrieval.
-    The free-text query field is metadata only; retrieval uses queries[*].image.
+    Endpoint that accepts agent vision_search requests and performs retrieval
+    with a joint image+text query embedding against the pure-image corpus index.
     """
     topk = request.topk or config.retrieval_topk
     if request.return_scores:
@@ -195,6 +221,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch the local Qwen3-VL image retriever.")
     parser.add_argument("--index_path", type=str, default="./index/qwen3_vl_embedding_Flat.index", help="Image corpus FAISS index file.")
     parser.add_argument("--corpus_path", type=str, default="./data/vision_corpus.jsonl", help="Local image corpus JSONL file.")
+    parser.add_argument("--meta_path", type=str, default=None, help="Index metadata used to validate the corpus fingerprint.")
     parser.add_argument("--topk", type=int, default=3, help="Number of retrieved images for one query image.")
     parser.add_argument("--retriever_model", type=str, default="Qwen/Qwen3-VL-Embedding-2B", help="Path or HF id of the image embedding model.")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for image embedding.")
@@ -203,7 +230,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_normalize", action="store_true", default=False, help="Disable L2 normalization for embeddings.")
     parser.add_argument("--faiss_gpu", action="store_true", help="Use GPU FAISS index.")
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8001)
 
     args = parser.parse_args()
 
@@ -217,6 +244,7 @@ if __name__ == "__main__":
         device=args.device,
         normalize_embeddings=not args.no_normalize,
         truncate_dim=args.truncate_dim,
+        meta_path=args.meta_path,
     )
     retriever = VisionDenseRetriever(config)
 

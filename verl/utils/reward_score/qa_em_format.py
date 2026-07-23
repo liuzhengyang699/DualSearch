@@ -2,6 +2,9 @@ import random
 import re
 import string
 
+from dual_search.protocol import extract_answer, validate_sequence
+from dual_search.reward.genrm_judge import compute_retrieval_penalty, get_retrieval_call_count
+
 
 def normalize_answer(s):
     def remove_articles(text):
@@ -30,85 +33,19 @@ def em_check(prediction, golden_answers):
     return 0
 
 
-def _assistant_content(text: str) -> str:
-    assistant_pattern = r"<\|im_start\|>assistant\s*"
-    assistant_match = re.search(assistant_pattern, text)
-    if assistant_match:
-        return text[assistant_match.end() :]
-    return text
-
-
 def is_valid_sequence(text):
-    content = _assistant_content(text)
+    """Validate the same native-Qwen trajectory used by rollout and SFT.
 
-    tags_to_check = ["think", "search", "information", "vision_search", "vision_information", "answer"]
-    for tag in tags_to_check:
-        opening_count = len(re.findall(f"<{tag}>", content))
-        closing_count = len(re.findall(f"</{tag}>", content))
-        if opening_count != closing_count:
-            return False, f"Mismatch in {tag} tags: {opening_count} opening vs {closing_count} closing tags"
+    This compatibility entry point is still imported by veRL's default QA
+    reward registry, so it must not silently accept DualSearch's retired XML
+    action protocol.
+    """
 
-    split_pattern = r"(</?(?:think|search|information|vision_search|vision_information|answer)>)"
-    parts = re.split(split_pattern, content)
-    state = "start"
-
-    for part in parts:
-        if not part.strip():
-            continue
-
-        if re.match(r"</?(?:think|search|information|vision_search|vision_information|answer)>", part):
-            if part == "<think>" and state in ["start", "information", "vision_information"]:
-                state = "in_think"
-            elif part == "</think>" and state == "in_think":
-                state = "after_think"
-            elif part == "<search>" and state == "after_think":
-                state = "in_search"
-            elif part == "</search>" and state == "in_search":
-                state = "after_search"
-            elif part == "<information>" and state == "after_search":
-                state = "in_information"
-            elif part == "</information>" and state == "in_information":
-                state = "information"
-            elif part == "<vision_search>" and state == "after_think":
-                state = "in_vision_search"
-            elif part == "</vision_search>" and state == "in_vision_search":
-                state = "after_vision_search"
-            elif part == "<vision_information>" and state == "after_vision_search":
-                state = "in_vision_information"
-            elif part == "</vision_information>" and state == "in_vision_information":
-                state = "vision_information"
-            elif part == "<answer>" and state == "after_think":
-                state = "in_answer"
-            elif part == "</answer>" and state == "in_answer":
-                state = "end"
-            else:
-                return False, f"Unexpected tag {part} in state {state}"
-        elif state in [
-            "in_think",
-            "in_search",
-            "in_information",
-            "in_vision_search",
-            "in_vision_information",
-            "in_answer",
-        ]:
-            continue
-        elif state in ["start", "after_think", "after_search", "information", "after_vision_search", "vision_information"]:
-            return False, f"Unexpected content '{part.strip()}' between tags (state: {state})"
-        else:
-            return False, f"Unexpected content in state {state}"
-
-    if state != "end":
-        return False, f"Incomplete sequence, ended in state {state}"
-
-    return True, "Valid sequence format"
+    return validate_sequence(text)
 
 
 def extract_solution(solution_str):
-    answer_pattern = r"<answer>(.*?)</answer>"
-    matches = list(re.finditer(answer_pattern, solution_str, re.DOTALL))
-    if not matches:
-        return None
-    return matches[-1].group(1).strip()
+    return extract_answer(solution_str)
 
 
 def compute_score_em(
@@ -143,5 +80,9 @@ def compute_score_em(
     return final_format_score
 
 
-def compute_score(solution_str, ground_truth, **kwargs):
-    return compute_score_em(solution_str, ground_truth, **kwargs)
+def compute_score(solution_str, ground_truth, extra_info=None, **kwargs):
+    """Compute PPO's EM reward with the shared DualSearch call penalty."""
+
+    base_score = compute_score_em(solution_str, ground_truth, **kwargs)
+    retrieval_count = get_retrieval_call_count(extra_info)
+    return base_score - compute_retrieval_penalty(retrieval_count)

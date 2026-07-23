@@ -35,18 +35,34 @@ def resolve_image_reference(item: Any, image_key: str = "image") -> Any:
 
 
 def make_image_embedding_input(image: Any, image_key: str = "image") -> Dict[str, Any]:
-    image = resolve_image_reference(image, image_key=image_key)
+    # Retrieval queries are dictionaries containing both ``image`` and
+    # ``query``/``text``.  Preserve the text instead of resolving the dict to
+    # only its image value.  Corpus builders still pass bare image references,
+    # so corpus embeddings remain pure-image embeddings.
+    text = None
     if isinstance(image, dict):
-        item = dict(image)
-        if isinstance(item.get("image"), str):
-            item["image"] = decode_image_data_url(item["image"]) or os.path.expanduser(item["image"])
-        return item
-    if isinstance(image, Image.Image):
-        return {"image": image.convert("RGB")}
-    if not isinstance(image, str):
-        raise TypeError(f"Expected an image path string, got {type(image).__name__}")
+        text = image.get("text")
+        if text is None:
+            text = image.get("query")
+        original = image
+        image = resolve_image_reference(image, image_key=image_key)
+        if image is original:
+            raise TypeError("Image input dictionary has no supported image reference.")
 
-    return {"image": decode_image_data_url(image) or os.path.expanduser(image)}
+    if isinstance(image, dict):
+        item = make_image_embedding_input(image, image_key=image_key)
+    elif isinstance(image, Image.Image):
+        item = {"image": image.convert("RGB")}
+    elif isinstance(image, str):
+        item = {"image": decode_image_data_url(image) or os.path.expanduser(image)}
+    else:
+        raise TypeError(f"Expected an image path string or PIL image, got {type(image).__name__}")
+
+    if text is not None:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Mixed image-text embedding input requires non-empty text.")
+        item["text"] = text.strip()
+    return item
 
 
 def decode_image_data_url(image: str) -> Optional[Image.Image]:

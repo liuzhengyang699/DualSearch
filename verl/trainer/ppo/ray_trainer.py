@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+from collections.abc import Mapping
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
@@ -71,6 +72,57 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+RETRIEVAL_RESOLVABLE_SUBSET = "retrieval_resolvable=true"
+
+
+def _is_explicit_true(value: Any) -> bool:
+    """Accept only real boolean true values for validation subset membership."""
+
+    return isinstance(value, (bool, np.bool_)) and bool(value)
+
+
+def _extract_retrieval_resolvable_mask(
+    extra_infos: Any,
+    fallback_values: Any = None,
+) -> list[bool]:
+    """Copy subset membership before reward workers can mutate ``extra_info``.
+
+    The canonical datasets store the flag inside ``extra_info`` and as a
+    top-level parquet column.  Prefer the nested value when it exists and use
+    the physical column only as a compatibility fallback.  Missing legacy
+    fields are deliberately treated as false rather than guessed from other
+    resolvability fields.
+    """
+
+    extras = list(extra_infos) if extra_infos is not None else []
+    fallbacks = list(fallback_values) if fallback_values is not None else []
+    if extras and fallbacks and len(extras) != len(fallbacks):
+        raise ValueError(
+            "retrieval_resolvable nested/top-level length mismatch: "
+            f"{len(extras)} != {len(fallbacks)}"
+        )
+    size = len(extras) or len(fallbacks)
+    if not extras:
+        extras = [None] * size
+    if not fallbacks:
+        fallbacks = [None] * size
+
+    result = []
+    for item, fallback in zip(extras, fallbacks, strict=True):
+        if isinstance(item, Mapping) and "retrieval_resolvable" in item:
+            value = item.get("retrieval_resolvable")
+        else:
+            value = fallback
+        result.append(_is_explicit_true(value))
+    return result
+
+
+def _filter_validation_values(values: list[Any], mask: list[bool], name: str) -> list[Any]:
+    if len(values) != len(mask):
+        raise ValueError(f"Validation subset mask length mismatch for {name}: {len(values)} != {len(mask)}")
+    return [value for value, keep in zip(values, mask, strict=True) if keep]
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -599,6 +651,7 @@ class RayPPOTrainer:
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        sample_subset_masks: dict[str, list[bool]] = {RETRIEVAL_RESOLVABLE_SUBSET: []}
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -620,6 +673,21 @@ class RayPPOTrainer:
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
+
+            repeated_extra_infos = test_batch.non_tensor_batch.get("extra_info")
+            repeated_top_level_flags = test_batch.non_tensor_batch.get("retrieval_resolvable")
+            resolvable_mask = _extract_retrieval_resolvable_mask(
+                repeated_extra_infos,
+                repeated_top_level_flags,
+            )
+            if not resolvable_mask:
+                resolvable_mask = [False] * len(test_batch.batch)
+            if len(resolvable_mask) != len(test_batch.batch):
+                raise ValueError(
+                    "retrieval_resolvable mask is not aligned with the repeated validation batch: "
+                    f"{len(resolvable_mask)} != {len(test_batch.batch)}"
+                )
+            sample_subset_masks[RETRIEVAL_RESOLVABLE_SUBSET].extend(resolvable_mask)
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -698,12 +766,16 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            reward_extra_infos_to_dump = dict(reward_extra_infos_dict)
+            reward_extra_infos_to_dump["retrieval_resolvable"] = sample_subset_masks[
+                RETRIEVAL_RESOLVABLE_SUBSET
+            ]
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=val_data_dir,
             )
 
@@ -717,28 +789,83 @@ class RayPPOTrainer:
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
+                "subset_masks": sample_subset_masks,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            subset_masks=sample_subset_masks,
+        )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+    def _val_metrics_update(
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+        subset_masks: dict[str, list[bool]] | None = None,
+    ):
         metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+
+        def append_processed_metrics(data_src2var2metric2val, subset_name: str | None = None):
+            subset_path = f"/subset/{subset_name}" if subset_name else ""
+            for data_source, var2metric2val in data_src2var2metric2val.items():
+                core_var = "acc" if "acc" in var2metric2val else "reward"
+                for var_name, metric2val in var2metric2val.items():
+                    if not metric2val:
+                        continue
+                    n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                    for metric_name, metric_val in metric2val.items():
+                        if (
+                            (var_name == core_var)
+                            and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                            and (f"@{n_max}" in metric_name)
+                        ):
+                            metric_sec = "val-core"
+                        else:
+                            metric_sec = "val-aux"
+                        pfx = f"{metric_sec}/{data_source}{subset_path}/{var_name}/{metric_name}"
+                        metric_dict[pfx] = metric_val
+
+        data_sources = list(data_sources)
+        sample_uids = list(sample_uids)
+        if len(data_sources) != len(sample_uids):
+            raise ValueError(f"Validation data source/uid length mismatch: {len(data_sources)} != {len(sample_uids)}")
+
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        append_processed_metrics(data_src2var2metric2val)
+
+        for subset_name, raw_mask in (subset_masks or {}).items():
+            mask = [_is_explicit_true(value) for value in raw_mask]
+            if len(mask) != len(sample_uids):
+                raise ValueError(
+                    f"Validation subset mask length mismatch for {subset_name}: {len(mask)} != {len(sample_uids)}"
+                )
+
+            filtered_sources = _filter_validation_values(data_sources, mask, "data_sources")
+            filtered_uids = _filter_validation_values(sample_uids, mask, "sample_uids")
+            filtered_infos = {
+                key: _filter_validation_values(list(values), mask, key)
+                for key, values in reward_extra_infos_dict.items()
+                if len(values) == len(mask)
+            }
+            if filtered_sources:
+                subset_metrics = process_validation_metrics(filtered_sources, filtered_uids, filtered_infos)
+                append_processed_metrics(subset_metrics, subset_name=subset_name)
+
+            for data_source in sorted(set(data_sources)):
+                source_indexes = [
+                    index
+                    for index, (source, keep) in enumerate(zip(data_sources, mask, strict=True))
+                    if source == data_source and keep
+                ]
+                subset_uids = [sample_uids[index] for index in source_indexes]
+                count_prefix = f"val-aux/{data_source}/subset/{subset_name}"
+                metric_dict[f"{count_prefix}/num_prompts"] = len(set(subset_uids))
+                metric_dict[f"{count_prefix}/num_responses"] = len(source_indexes)
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
@@ -752,9 +879,21 @@ class RayPPOTrainer:
         if result_a is None and result_b is None:
             return {}
         if result_a is None:
-            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_a = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {},
+                "subset_masks": {},
+            }
         if result_b is None:
-            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_b = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {},
+                "subset_masks": {},
+            }
 
         if not result_a.get("data_sources") and not result_b.get("data_sources"):
             return {}
@@ -770,7 +909,38 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [])
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        subset_masks = {}
+        subset_names = (
+            set(result_a.get("subset_masks", {}))
+            | set(result_b.get("subset_masks", {}))
+            | {RETRIEVAL_RESOLVABLE_SUBSET}
+        )
+        for subset_name in subset_names:
+            mask_a = result_a.get("subset_masks", {}).get(subset_name)
+            mask_b = result_b.get("subset_masks", {}).get(subset_name)
+            if mask_a is None:
+                mask_a = [False] * len(result_a["sample_uids"])
+            if mask_b is None:
+                mask_b = [False] * len(result_b["sample_uids"])
+            if len(mask_a) != len(result_a["sample_uids"]):
+                raise ValueError(
+                    f"Validation subset mask length mismatch for first {subset_name} payload: "
+                    f"{len(mask_a)} != {len(result_a['sample_uids'])}"
+                )
+            if len(mask_b) != len(result_b["sample_uids"]):
+                raise ValueError(
+                    f"Validation subset mask length mismatch for second {subset_name} payload: "
+                    f"{len(mask_b)} != {len(result_b['sample_uids'])}"
+                )
+            subset_masks[subset_name] = list(mask_a) + list(mask_b)
+
+        return self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            subset_masks=subset_masks,
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.

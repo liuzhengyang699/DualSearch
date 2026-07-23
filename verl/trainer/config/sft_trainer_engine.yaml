@@ -26,10 +26,11 @@ data:
   messages_key: messages  # Key for messages list in multi-turn mode
   tools_key: tools  # Key for tools list in multi-turn mode
   enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
-  enable_thinking_default: none         # The default value when enable_thinking_key is not present in the dataset
+  # Default passed to the chat template when the dataset has no per-row flag.
+  enable_thinking_default: null
   pad_mode: no_padding
   # for right padding
-  max_length: 1024
+  max_length: 8192
   truncation: error
   balance_dp_token: False # to be implement
   custom_cls:
@@ -39,22 +40,19 @@ data:
   apply_chat_template_kwargs: {}
   num_workers: 8
 
-  # MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids`
-  # as a whole sequence, which may not equal to apply_chat_template to whole messages at once. 
-  # For example, Qwen Thinking series models add <think></think> tags to last turn, please check
-  # your tokenizer chat template settings.
-  # Set to True to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids.
+  # Allow assistant-mask construction when a custom template is not prefix-stable.
+  # Keep false for the native Qwen template unless the rendered token diff has been reviewed.
   ignore_input_ids_mismatch: False
 
 # Checkpoint configuration
 checkpoint:
   _target_: verl.trainer.config.CheckpointConfig
   # What to include in saved checkpoints
-  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
-  save_contents: ["model", "optimizer", "extra"]
+  # Save both resumable shards and an immediately loadable Hugging Face model.
+  save_contents: ["model", "optimizer", "extra", "hf_model"]
 
   # For more flexibility, you can specify the contents to load from the checkpoint.
-  load_contents: ${checkpoint.save_contents}
+  load_contents: ["model", "optimizer", "extra"]
   # Mbridge config extension.
   mbridge_config: {}
 

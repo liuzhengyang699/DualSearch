@@ -219,6 +219,17 @@ class SFTTrainer:
         else:
             val_dataset = None
 
+        if len(train_dataset) == 0:
+            raise ValueError(
+                "SFT training dataset is empty: the builder produced no verified teacher trajectories."
+            )
+        if val_dataset is not None and len(val_dataset) == 0:
+            logger.warning(
+                "SFT validation dataset is empty (usually because fewer than two image groups succeeded); "
+                "continuing without validation."
+            )
+            val_dataset = None
+
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
     def _build_dataloader(self):
@@ -254,7 +265,7 @@ class SFTTrainer:
 
         if self.val_dataset:
             self.val_sampler = DistributedSampler(
-                self.val_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
+                self.val_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=False
             )
             self.val_dataloader = StatefulDataLoader(
                 dataset=self.val_dataset,
@@ -263,7 +274,7 @@ class SFTTrainer:
                 collate_fn=self.collate_fn,
                 num_workers=self.config.data.num_workers,
                 pin_memory=False,
-                drop_last=True,
+                drop_last=False,
                 pin_memory_device=device_name,
             )
         else:

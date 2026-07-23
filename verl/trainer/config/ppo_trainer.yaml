@@ -372,7 +372,7 @@ transfer_queue:
       device_name: ""
 
 # Maximum DualSearch agent interaction turns before final generation.
-max_turns: 2
+max_turns: 8
 
 # DualSearch retrieval backend configuration.
 retriever:

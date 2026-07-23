@@ -95,7 +95,7 @@ def default_compute_score(
     ]:
         from . import qa_em_format
 
-        res = qa_em_format.compute_score(solution_str, ground_truth)
+        res = qa_em_format.compute_score(solution_str, ground_truth, extra_info=extra_info)
 
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")

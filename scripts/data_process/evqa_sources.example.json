@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "output_dir": "../../../data/evqa_search",
+  "seed": 42,
+  "evqa": {
+    "train_csv": {"path": "/local/path/to/evqa/train.csv", "sha256": ""},
+    "val_csv": {"path": "/local/path/to/evqa/val.csv", "sha256": ""}
+  },
+  "inaturalist": {
+    "train": {
+      "metadata": {"path": "/local/path/to/inat2021/train.json", "sha256": ""},
+      "archive": {"path": "/local/path/to/inat2021/train.tar.gz", "sha256": ""},
+      "image_root": "/local/path/to/extracted/inat2021"
+    },
+    "val": {
+      "metadata": {"path": "/local/path/to/inat2021/val.json", "sha256": ""},
+      "archive": {"path": "/local/path/to/inat2021/val.tar.gz", "sha256": ""},
+      "image_root": "/local/path/to/extracted/inat2021"
+    }
+  },
+  "wikipedia": {
+    "kb": {"path": "/local/path/to/encyclopedic_kb_wiki.zip", "sha256": ""}
+  },
+  "indexes": {
+    "allow_remote_models": false,
+    "vision": {
+      "model_path": "/local/path/to/Qwen3-VL-Embedding-2B",
+      "batch_size": 32,
+      "faiss_type": "Flat",
+      "save_embedding": true
+    },
+    "text": {
+      "model_path": "/local/path/to/bge-m3",
+      "batch_size": 16,
+      "max_length": 8192,
+      "faiss_type": "Flat",
+      "save_embedding": true
+    }
+  },
+  "sft": {
+    "teacher_base_url": "http://127.0.0.1:9001",
+    "teacher_model": "/local/path/to/multimodal-teacher",
+    "teacher_api_key_env": "VLLM_API_KEY",
+    "observation_tokenizer_path": "/local/path/to/Qwen3-VL-4B-Instruct",
+    "observation_tokenizer_trust_remote_code": true,
+    "sample_fraction": 0.05,
+    "validation_fraction": 0.1,
+    "oracle_top_k": 3,
+    "max_tool_response_tokens": 500
+  }
+}
