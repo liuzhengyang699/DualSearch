@@ -9,7 +9,10 @@ from fastapi import FastAPI
 from pydantic import BaseModel, conint, constr
 from tqdm import tqdm
 
-from dual_search.data.fingerprints import canonical_model_reference, load_and_validate_index_meta
+from dual_search.search.fingerprints import (
+    load_and_validate_index_meta,
+    qwen3_vl_encoder_config,
+)
 
 try:
     from dual_search.search.vision_retrieval import (
@@ -71,14 +74,11 @@ class VisionDenseRetriever:
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
         meta_path = config.meta_path or str(Path(config.index_path).parent / "vision_index_meta.json")
-        expected_encoder_config = {
-            "encoder": "Qwen3VLImageEncoder",
-            "model_reference": canonical_model_reference(config.retrieval_model_path),
-            "normalize_embeddings": bool(config.normalize_embeddings),
-            "truncate_dim": config.truncate_dim,
-            "corpus_input_mode": "image_only",
-            "query_input_mode": "image_text_joint",
-        }
+        expected_encoder_config = qwen3_vl_encoder_config(
+            config.retrieval_model_path,
+            normalize_embeddings=config.normalize_embeddings,
+            truncate_dim=config.truncate_dim,
+        )
         self.index_meta = load_and_validate_index_meta(
             meta_path,
             config.corpus_path,

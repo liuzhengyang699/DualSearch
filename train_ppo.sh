@@ -4,9 +4,8 @@ set -xeuo pipefail
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
-DATA_DIR=${DATA_DIR:-data/evqa_search}
-TRAIN_FILE=${TRAIN_FILE:-${DATA_DIR}/train.parquet}
-TEST_FILE=${TEST_FILE:-${DATA_DIR}/test.parquet}
+TRAIN_FILE=${TRAIN_FILE:-}
+TEST_FILE=${TEST_FILE:-}
 
 BASE_MODEL=${BASE_MODEL:-Qwen/Qwen3-VL-4B-Instruct}
 WAND_PROJECT=${WAND_PROJECT:-DualSearch}
@@ -14,6 +13,23 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME:-dual-search-ppo-qwen3-vl-4b}
 
 TEXT_RETRIEVER_URL=${TEXT_RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}
 VISION_RETRIEVER_URL=${VISION_RETRIEVER_URL:-http://127.0.0.1:8001/vision_retrieve}
+
+if [[ -z "${TRAIN_FILE}" ]]; then
+    echo "TRAIN_FILE is required. Set it to the absolute path of the generated 11K train.parquet." >&2
+    exit 1
+fi
+if [[ ! -f "${TRAIN_FILE}" ]]; then
+    echo "TRAIN_FILE does not exist: ${TRAIN_FILE}" >&2
+    exit 1
+fi
+if [[ -z "${TEST_FILE}" ]]; then
+    echo "TEST_FILE is required and must point to an external evaluation Parquet; the 11K builder does not generate test.parquet." >&2
+    exit 1
+fi
+if [[ ! -f "${TEST_FILE}" ]]; then
+    echo "External TEST_FILE does not exist: ${TEST_FILE}" >&2
+    exit 1
+fi
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \

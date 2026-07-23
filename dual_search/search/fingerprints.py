@@ -1,4 +1,4 @@
-"""Stable fingerprints shared by the data pipeline and retrieval indexes."""
+"""Stable fingerprints shared by standalone builders and retrieval runtime."""
 
 from __future__ import annotations
 
@@ -10,7 +10,20 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 FINGERPRINT_SCHEMA_VERSION = 1
+MODEL_FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_ID_KEYS = ("id", "sample_id", "image_key")
+_MODEL_FINGERPRINT_IGNORED_DIRECTORIES = {
+    ".cache",
+    ".git",
+    "__pycache__",
+}
+_MODEL_FINGERPRINT_IGNORED_SUFFIXES = {
+    ".lock",
+    ".log",
+    ".pyc",
+    ".pyo",
+    ".tmp",
+}
 
 
 def canonical_json(value: Any) -> str:
@@ -53,6 +66,108 @@ def canonical_model_reference(value: str | Path) -> str:
     text = str(value).strip()
     candidate = Path(os.path.expandvars(os.path.expanduser(text)))
     return normalize_local_path(candidate) if candidate.exists() else text
+
+
+def model_fingerprint(value: str | Path) -> dict[str, Any]:
+    """Fingerprint a model reference, including local checkpoint contents.
+
+    A path alone is not a sufficient encoder identity: replacing weights in
+    the same directory would otherwise leave an old index looking valid.  For
+    local checkpoints we therefore hash every non-transient regular file in
+    deterministic relative-path order. Python caches, lock files, and VCS
+    metadata are excluded so merely loading a model cannot invalidate it.
+    Remote model IDs remain representable for legacy runtime callers, but
+    standalone builders require existing local directories before reaching
+    this helper.
+    """
+
+    reference = canonical_model_reference(value)
+    candidate = Path(os.path.expandvars(os.path.expanduser(str(value).strip())))
+    if not candidate.is_dir():
+        return {
+            "model_fingerprint_schema_version": MODEL_FINGERPRINT_SCHEMA_VERSION,
+            "kind": "reference",
+            "reference": reference,
+        }
+
+    root = candidate.resolve()
+    files = sorted(
+        (
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and not set(path.relative_to(root).parts).intersection(
+                _MODEL_FINGERPRINT_IGNORED_DIRECTORIES
+            )
+            and path.suffix.casefold() not in _MODEL_FINGERPRINT_IGNORED_SUFFIXES
+        ),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+    if not files:
+        raise ValueError(f"Local model directory is empty: {root}")
+
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for file_path in files:
+        relative = file_path.relative_to(root).as_posix()
+        file_size = file_path.stat().st_size
+        file_sha256 = sha256_file(file_path)
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(file_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(file_sha256.encode("ascii"))
+        digest.update(b"\n")
+        total_bytes += file_size
+
+    return {
+        "model_fingerprint_schema_version": MODEL_FINGERPRINT_SCHEMA_VERSION,
+        "kind": "local_directory",
+        "reference": normalize_local_path(root),
+        "files_sha256": digest.hexdigest(),
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+    }
+
+
+def bge_m3_encoder_config(
+    model_path: str | Path,
+    *,
+    max_length: int,
+    use_fp16: bool,
+    fingerprint: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the canonical BGE-M3 vector-space configuration."""
+
+    return {
+        "encoder": "BGEM3DenseEncoder",
+        "model_reference": canonical_model_reference(model_path),
+        "model_fingerprint": dict(fingerprint or model_fingerprint(model_path)),
+        "normalize_embeddings": True,
+        "max_length": int(max_length),
+        "use_fp16": bool(use_fp16),
+        "input_mode": "text",
+    }
+
+
+def qwen3_vl_encoder_config(
+    model_path: str | Path,
+    *,
+    normalize_embeddings: bool,
+    truncate_dim: int | None,
+    fingerprint: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the canonical Qwen3-VL image/query vector-space configuration."""
+
+    return {
+        "encoder": "Qwen3VLImageEncoder",
+        "model_reference": canonical_model_reference(model_path),
+        "model_fingerprint": dict(fingerprint or model_fingerprint(model_path)),
+        "normalize_embeddings": bool(normalize_embeddings),
+        "truncate_dim": truncate_dim,
+        "corpus_input_mode": "image_only",
+        "query_input_mode": "image_text_joint",
+    }
 
 
 def assert_encoder_config(

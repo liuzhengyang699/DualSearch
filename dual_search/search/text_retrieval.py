@@ -8,7 +8,10 @@ from typing import Any, Sequence
 import faiss
 import numpy as np
 
-from dual_search.data.fingerprints import canonical_model_reference, load_and_validate_index_meta
+from dual_search.search.fingerprints import (
+    bge_m3_encoder_config,
+    load_and_validate_index_meta,
+)
 
 
 DEFAULT_BGE_M3_MODEL = "BAAI/bge-m3"
@@ -249,14 +252,11 @@ class HybridRetriever:
         self.config = config
         self.corpus = load_jsonl_corpus(config.corpus_path)
         meta_path = config.meta_path or str(Path(config.index_path).parent / DEFAULT_META_NAME)
-        expected_encoder_config = {
-            "encoder": "BGEM3DenseEncoder",
-            "model_reference": canonical_model_reference(config.dense_model_path),
-            "normalize_embeddings": True,
-            "max_length": int(config.dense_max_length),
-            "use_fp16": bool(config.use_fp16),
-            "input_mode": "text",
-        }
+        expected_encoder_config = bge_m3_encoder_config(
+            config.dense_model_path,
+            max_length=config.dense_max_length,
+            use_fp16=config.use_fp16,
+        )
         self.index_meta = load_and_validate_index_meta(
             meta_path,
             config.corpus_path,

@@ -9,7 +9,6 @@
 **/wandb
 
 # Vision-Search-R1 local data, retrieval stores, and generated artifacts
-/data/
 /dataset/
 /index/
 /corpus/
@@ -22,6 +21,20 @@
 *.faiss
 *.index
 *.safetensors
+
+# The root data/ directory contains tracked builder entry points and the public
+# example config. Keep only machine-local configuration and generated data out.
+/data/config.local.json
+/data/*.local.json
+/data/.build_cache/
+/data/raw/
+/data/output/
+/data/generated/
+/data/artifacts/
+/data/indexes/
+/data/models/
+/data/*.sqlite
+/data/*.sqlite-*
 
 # Credentials and local secrets
 .env
@@ -46,7 +59,6 @@ tensorflow/my_graph/*
 .idea/
 # C extensions
 *.so
-/data/
 sft/output/*
 sft/data/*
 
@@ -138,9 +150,6 @@ ENV/
 
 # Mac
 .DS_Store
-
-# output logs
-tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 
 # vim
 *.swp

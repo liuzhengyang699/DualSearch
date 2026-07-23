@@ -23,13 +23,20 @@ import math
 import mimetypes
 import os
 import re
+import shutil
+import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit, urlunsplit
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from dual_search.protocol import (
     ProtocolError,
@@ -39,6 +46,11 @@ from dual_search.protocol import (
     format_vision_results,
     sanitize_tool_response,
     validate_tool_call_payload,
+)
+from dual_search.search.fingerprints import (
+    model_fingerprint,
+    sha256_file,
+    stable_digest,
 )
 
 
@@ -1671,6 +1683,21 @@ def _load_heldout_image_keys(manifest: Mapping[str, Any], manifest_path: Path) -
         # list is recognized without copying it into build_manifest.json.
         wrapped = {"heldout": external_value}
         result.update(_extract_heldout_image_keys(wrapped))
+    expected_digest = (
+        heldout.get("image_keys_sha256")
+        if isinstance(heldout, Mapping)
+        else None
+    )
+    if not expected_digest:
+        raise ValueError(
+            "build_manifest.json is missing heldout.image_keys_sha256; "
+            "rerun data/build_rl.py."
+        )
+    if stable_digest(sorted(result)) != str(expected_digest):
+        raise ValueError(
+            "heldout image keys do not match build_manifest.json; rerun "
+            "data/build_rl.py."
+        )
     return result
 
 
@@ -1718,6 +1745,66 @@ def _stage_json(value: Mapping[str, Any], final_path: Path) -> Path:
     return Path(temp_name)
 
 
+def _publish_staged_files(staged: Sequence[tuple[Path, Path]]) -> None:
+    if not staged:
+        return
+    backup_root = Path(
+        tempfile.mkdtemp(prefix=".sft-publish-backup-", dir=staged[0][1].parent)
+    )
+    backups: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for index, (_, final) in enumerate(staged):
+            if final.exists():
+                backup = backup_root / f"{index:02d}-{final.name}"
+                os.replace(final, backup)
+                backups.append((final, backup))
+        for temporary, final in staged:
+            os.replace(temporary, final)
+            published.append(final)
+    except Exception:
+        for final in reversed(published):
+            final.unlink(missing_ok=True)
+        for final, backup in reversed(backups):
+            if backup.exists():
+                os.replace(backup, final)
+        raise
+    finally:
+        shutil.rmtree(backup_root, ignore_errors=True)
+
+
+def _validate_rl_artifact_generation(
+    manifest: Mapping[str, Any],
+    *,
+    train_path: Path,
+    vision_path: Path,
+    text_path: Path,
+) -> None:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ValueError(
+            "RL build manifest has no artifact fingerprint table; rerun build_rl.py."
+        )
+    for name, path in (
+        ("train.parquet", train_path),
+        ("vision_corpus.jsonl", vision_path),
+        ("text_corpus.jsonl", text_path),
+    ):
+        record = artifacts.get(name)
+        if not isinstance(record, Mapping) or not str(
+            record.get("sha256") or ""
+        ).strip():
+            raise ValueError(
+                f"RL build manifest has no SHA256 for {name}; rerun build_rl.py."
+            )
+        actual = sha256_file(path)
+        if actual != str(record["sha256"]):
+            raise ValueError(
+                f"{name} does not match build_manifest.json; do not mix "
+                "artifacts from different RL builds."
+            )
+
+
 def build_sft_files(
     *,
     train_parquet: str | Path,
@@ -1728,6 +1815,7 @@ def build_sft_files(
     teacher: TeacherClient,
     config: SFTBuilderConfig | None = None,
     observation_tokenizer: Any | None = None,
+    build_fingerprint: str | None = None,
 ) -> SFTBuildResult:
     import pandas as pd
 
@@ -1739,9 +1827,6 @@ def build_sft_files(
         if not path.is_file():
             raise FileNotFoundError(f"required SFT input does not exist: {path}")
 
-    train_records = [_plain(row) for row in pd.read_parquet(train_path).to_dict(orient="records")]
-    vision_corpus = _load_jsonl(vision_path)
-    text_corpus = _load_jsonl(text_path)
     manifest = _load_json(manifest_file)
     if not isinstance(manifest, Mapping):
         raise ValueError(f"build manifest is not a JSON object: {manifest_file}")
@@ -1749,6 +1834,18 @@ def build_sft_files(
         raise ValueError(
             f"{_LEGACY_REBUILD_MESSAGE}: manifest {manifest_file} is not schema v2"
         )
+    _validate_rl_artifact_generation(
+        manifest,
+        train_path=train_path,
+        vision_path=vision_path,
+        text_path=text_path,
+    )
+    train_records = [
+        _plain(row)
+        for row in pd.read_parquet(train_path).to_dict(orient="records")
+    ]
+    vision_corpus = _load_jsonl(vision_path)
+    text_corpus = _load_jsonl(text_path)
     heldout_keys = _load_heldout_image_keys(manifest, manifest_file)
     if not heldout_keys:
         raise ValueError("manifest contains no held-out/query image keys; refusing to build SFT data")
@@ -1771,6 +1868,8 @@ def build_sft_files(
         staged.append((_stage_parquet(result.train_rows, train_final), train_final))
         staged.append((_stage_parquet(result.val_rows, val_final), val_final))
         report = dict(result.report)
+        if build_fingerprint is not None:
+            report["build_fingerprint"] = build_fingerprint
         report["paths"] = {
             "train_parquet": str(train_path.resolve()),
             "vision_corpus": str(vision_path.resolve()),
@@ -1780,8 +1879,7 @@ def build_sft_files(
             "sft_val": str(val_final.resolve()),
         }
         staged.append((_stage_json(report, report_final), report_final))
-        for temporary, final in staged:
-            os.replace(temporary, final)
+        _publish_staged_files(staged)
         result.report = report
     except Exception:
         for temporary, _ in staged:
@@ -1790,65 +1888,398 @@ def build_sft_files(
     return result
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build verified DualSearch cold-start SFT Parquet files.")
-    parser.add_argument("--train-parquet", required=True)
-    parser.add_argument("--vision-corpus", required=True)
-    parser.add_argument("--text-corpus", required=True)
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--teacher-base-url", required=True)
-    parser.add_argument("--teacher-model", required=True)
-    parser.add_argument("--teacher-api-key-env", default="VLLM_API_KEY")
-    parser.add_argument("--sample-fraction", type=float, default=0.05)
-    parser.add_argument("--validation-fraction", type=float, default=0.10)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--oracle-top-k", type=int, default=3)
-    parser.add_argument(
-        "--observation-tokenizer",
-        default=None,
-        help="Optional local Qwen tokenizer path for exact wrapper-inclusive observation truncation.",
+_SFT_CONFIG_KEYS = {
+    "teacher_base_url",
+    "teacher_model",
+    "teacher_api_key_env",
+    "observation_tokenizer_path",
+    "timeout",
+    "retries",
+}
+_FIXED_SFT_FIELDS = {
+    "sample_fraction": 0.05,
+    "validation_fraction": 0.10,
+    "oracle_top_k": 3,
+    "max_tool_response_tokens": DEFAULT_TOOL_RESPONSE_TOKENS,
+}
+_SFT_CACHE_MARKER = "sft_build_manifest.json"
+_SFT_OUTPUT_NAMES = (
+    "sft_train.parquet",
+    "sft_val.parquet",
+    "sft_build_report.json",
+)
+
+
+def _standalone_config(config_path: str | Path) -> tuple[Path, int, dict[str, Any]]:
+    path = Path(config_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Config does not exist: {path}")
+    value = _load_json(path)
+    if not isinstance(value, Mapping):
+        raise ValueError("Config root must be a JSON object.")
+
+    output_text = os.path.expandvars(os.path.expanduser(str(value.get("output_dir") or "")))
+    output_dir = Path(output_text)
+    if not output_text or not output_dir.is_absolute():
+        raise ValueError("output_dir must be an absolute path.")
+    output_dir = output_dir.resolve()
+    if output_dir == PROJECT_ROOT or output_dir.is_relative_to(PROJECT_ROOT):
+        raise ValueError(
+            "output_dir must be outside the DualSearch repository checkout."
+        )
+
+    raw_seed = value.get("seed", 42)
+    if isinstance(raw_seed, bool) or not isinstance(raw_seed, int):
+        raise ValueError("seed must be an integer.")
+
+    raw_sft = value.get("sft")
+    if not isinstance(raw_sft, Mapping):
+        raise ValueError("sft must be a JSON object.")
+    forbidden = sorted(set(raw_sft).intersection(_FIXED_SFT_FIELDS))
+    if forbidden:
+        fixed = ", ".join(
+            f"{name}={_FIXED_SFT_FIELDS[name]!r}" for name in forbidden
+        )
+        raise ValueError(
+            "SFT sampling/oracle/truncation policy is fixed and cannot be "
+            f"overridden in config: {fixed}."
+        )
+    unknown = sorted(set(raw_sft).difference(_SFT_CONFIG_KEYS))
+    if unknown:
+        raise ValueError(f"Unsupported sft config fields: {unknown}")
+
+    sft = dict(raw_sft)
+    for required in (
+        "teacher_base_url",
+        "teacher_model",
+        "observation_tokenizer_path",
+    ):
+        if not str(sft.get(required) or "").strip():
+            raise ValueError(f"sft.{required} must be a non-empty string.")
+    for field in ("teacher_model", "observation_tokenizer_path"):
+        raw_model_path = Path(
+            os.path.expandvars(
+                os.path.expanduser(str(sft[field]).strip())
+            )
+        )
+        local_model_path = (
+            raw_model_path
+            if raw_model_path.is_absolute()
+            else path.parent / raw_model_path
+        ).resolve()
+        if not local_model_path.is_dir():
+            raise FileNotFoundError(
+                f"sft.{field} must be an existing local model directory: "
+                f"{local_model_path}"
+            )
+        sft[field] = str(local_model_path)
+    timeout = sft.get("timeout", 120.0)
+    if isinstance(timeout, bool):
+        raise ValueError("sft.timeout must be positive.")
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sft.timeout must be positive.") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("sft.timeout must be positive.")
+    retries = sft.get("retries", 2)
+    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        raise ValueError("sft.retries must be a non-negative integer.")
+    sft["timeout"] = timeout
+    sft["retries"] = retries
+    return output_dir, raw_seed, sft
+
+
+def _resolve_observation_tokenizer_path(
+    config_path: Path,
+    sft: Mapping[str, Any],
+) -> Path | None:
+    raw = str(sft.get("observation_tokenizer_path") or "").strip()
+    if not raw:
+        raise ValueError(
+            "sft.observation_tokenizer_path is required and must be local."
+        )
+    expanded = Path(os.path.expandvars(os.path.expanduser(raw)))
+    path = (
+        expanded
+        if expanded.is_absolute()
+        else config_path.parent / expanded
+    ).resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"observation tokenizer must be a local directory: {path}"
+        )
+    return path
+
+
+def _query_pixel_fingerprint(train_path: Path) -> dict[str, Any]:
+    import pandas as pd
+
+    unique: dict[tuple[str, str], dict[str, str]] = {}
+    frame = pd.read_parquet(train_path, columns=["query_images"])
+    for raw_images in frame["query_images"].tolist():
+        images = _plain(raw_images)
+        if not isinstance(images, list):
+            raise ValueError("train.parquet query_images must be a list.")
+        for raw_image in images:
+            if not isinstance(raw_image, Mapping):
+                raise ValueError(
+                    "train.parquet contains an invalid query image record."
+                )
+            image_key = str(raw_image.get("image_key") or "").strip()
+            raw_path = str(raw_image.get("image") or "").strip()
+            if not image_key or not raw_path:
+                raise ValueError(
+                    "train.parquet contains an incomplete query image record."
+                )
+            normalized_path = os.path.normcase(
+                str(
+                    Path(
+                        os.path.expandvars(os.path.expanduser(raw_path))
+                    ).resolve(strict=False)
+                )
+            )
+            key = (image_key, normalized_path)
+            if key in unique:
+                continue
+            image_path = Path(normalized_path)
+            if not image_path.is_file():
+                raise FileNotFoundError(
+                    f"RL query image does not exist: {image_path}"
+                )
+            unique[key] = {
+                "image_key": image_key,
+                "normalized_path": normalized_path,
+                "file_sha256": sha256_file(image_path),
+            }
+    ordered = [unique[key] for key in sorted(unique)]
+    return {"count": len(ordered), "sha256": stable_digest(ordered)}
+
+
+def _sft_build_fingerprint(
+    *,
+    output_dir: Path,
+    seed: int,
+    sft: Mapping[str, Any],
+    tokenizer_path: Path | None,
+) -> tuple[str, dict[str, Any]]:
+    inputs: dict[str, Any] = {}
+    for name in (
+        "train.parquet",
+        "vision_corpus.jsonl",
+        "text_corpus.jsonl",
+        "build_manifest.json",
+    ):
+        path = output_dir / name
+        if not path.is_file():
+            raise FileNotFoundError(f"Required SFT input does not exist: {path}")
+        inputs[name] = {"path": str(path), "sha256": sha256_file(path)}
+    manifest = _load_json(output_dir / "build_manifest.json")
+    if not isinstance(manifest, Mapping):
+        raise ValueError("build_manifest.json must be a JSON object.")
+    _validate_rl_artifact_generation(
+        manifest,
+        train_path=output_dir / "train.parquet",
+        vision_path=output_dir / "vision_corpus.jsonl",
+        text_path=output_dir / "text_corpus.jsonl",
     )
-    parser.add_argument("--max-tool-response-tokens", type=int, default=DEFAULT_TOOL_RESPONSE_TOKENS)
-    parser.add_argument("--teacher-timeout", type=float, default=120.0)
-    parser.add_argument("--teacher-max-retries", type=int, default=2)
+    heldout_keys = _load_heldout_image_keys(
+        manifest,
+        output_dir / "build_manifest.json",
+    )
+    if not heldout_keys:
+        raise ValueError(
+            "build_manifest.json contains no heldout image keys."
+        )
+    query_pixels = _query_pixel_fingerprint(output_dir / "train.parquet")
+    expected_pixel_table = manifest.get("pixel_fingerprints")
+    expected_query_pixels = (
+        expected_pixel_table.get("query")
+        if isinstance(expected_pixel_table, Mapping)
+        else None
+    )
+    if not isinstance(expected_query_pixels, Mapping) or (
+        str(expected_query_pixels.get("sha256") or "")
+        != query_pixels["sha256"]
+        or int(expected_query_pixels.get("count", -1))
+        != int(query_pixels["count"])
+    ):
+        raise ValueError(
+            "RL query image pixels do not match build_manifest.json; rerun "
+            "data/build_rl.py before building SFT."
+        )
+    inputs["heldout_image_keys"] = {
+        "count": len(heldout_keys),
+        "sha256": stable_digest(sorted(heldout_keys)),
+    }
+    inputs["query_pixels"] = query_pixels
+    teacher_config = {
+        key: sft.get(key)
+        for key in sorted(_SFT_CONFIG_KEYS)
+        if key != "teacher_api_key_env"
+    }
+    teacher_config["teacher_api_key_env"] = str(
+        sft.get("teacher_api_key_env") or "VLLM_API_KEY"
+    )
+    teacher_config["teacher_model_fingerprint"] = model_fingerprint(
+        str(sft["teacher_model"])
+    )
+    tokenizer_fingerprint = (
+        model_fingerprint(tokenizer_path)
+        if tokenizer_path is not None
+        else {"mode": "unavailable"}
+    )
+    payload = {
+        "schema_version": 2,
+        "builder": "dual_search_fixed_sft",
+        "seed": seed,
+        "fixed_recipe": _FIXED_SFT_FIELDS,
+        "teacher": teacher_config,
+        "observation_tokenizer": tokenizer_fingerprint,
+        "inputs": inputs,
+    }
+    return stable_digest(payload), inputs
+
+
+def _sft_cache_reusable(
+    *,
+    output_dir: Path,
+    cache_marker: Path,
+    build_fingerprint: str,
+) -> bool:
+    if not cache_marker.is_file():
+        return False
+    try:
+        marker = _load_json(cache_marker)
+        report = _load_json(output_dir / "sft_build_report.json")
+        if not isinstance(marker, Mapping) or not isinstance(report, Mapping):
+            return False
+        if (
+            marker.get("build_fingerprint") != build_fingerprint
+            or report.get("build_fingerprint") != build_fingerprint
+        ):
+            return False
+        artifacts = marker.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            return False
+        for name in _SFT_OUTPUT_NAMES:
+            record = artifacts.get(name)
+            path = output_dir / name
+            if (
+                not isinstance(record, Mapping)
+                or not path.is_file()
+                or sha256_file(path) != str(record.get("sha256") or "")
+            ):
+                return False
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _write_sft_cache_marker(
+    *,
+    marker_path: Path,
+    output_dir: Path,
+    build_fingerprint: str,
+    inputs: Mapping[str, Any],
+) -> None:
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    value = {
+        "schema_version": 2,
+        "stage": "sft",
+        "status": "complete",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "build_fingerprint": build_fingerprint,
+        "inputs": dict(inputs),
+        "artifacts": {
+            name: {
+                "path": str(output_dir / name),
+                "sha256": sha256_file(output_dir / name),
+            }
+            for name in _SFT_OUTPUT_NAMES
+        },
+    }
+    temporary = _stage_json(value, marker_path)
+    try:
+        os.replace(temporary, marker_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build verified DualSearch cold-start SFT Parquet files."
+    )
+    parser.add_argument("--config", required=True, help="Shared DualSearch JSON config.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore a matching SFT cache manifest and rebuild.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
+    config_path = Path(args.config).expanduser().resolve()
+    output_dir, seed, sft = _standalone_config(config_path)
+    tokenizer_path = _resolve_observation_tokenizer_path(config_path, sft)
+    build_fingerprint, inputs = _sft_build_fingerprint(
+        output_dir=output_dir,
+        seed=seed,
+        sft=sft,
+        tokenizer_path=tokenizer_path,
+    )
+    cache_marker = output_dir / ".build_cache" / _SFT_CACHE_MARKER
+    if not args.force and _sft_cache_reusable(
+        output_dir=output_dir,
+        cache_marker=cache_marker,
+        build_fingerprint=build_fingerprint,
+    ):
+        report = _load_json(output_dir / "sft_build_report.json")
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
     observation_tokenizer = None
-    if args.observation_tokenizer:
-        tokenizer_path = Path(args.observation_tokenizer).expanduser()
-        if not tokenizer_path.exists():
-            raise FileNotFoundError(f"observation tokenizer must be local: {tokenizer_path}")
+    if tokenizer_path is not None:
         from transformers import AutoTokenizer
 
-        observation_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+        observation_tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            local_files_only=True,
+        )
+    api_key_env = str(sft.get("teacher_api_key_env") or "VLLM_API_KEY").strip()
     teacher = VLLMTeacherClient(
         TeacherConfig(
-            base_url=args.teacher_base_url,
-            model=args.teacher_model,
-            api_key=os.getenv(args.teacher_api_key_env),
-            timeout_seconds=args.teacher_timeout,
-            max_retries=args.teacher_max_retries,
+            base_url=str(sft["teacher_base_url"]).strip(),
+            model=str(sft["teacher_model"]).strip(),
+            api_key=os.getenv(api_key_env) if api_key_env else None,
+            timeout_seconds=float(sft["timeout"]),
+            max_retries=int(sft["retries"]),
         )
     )
     result = build_sft_files(
-        train_parquet=args.train_parquet,
-        vision_corpus_path=args.vision_corpus,
-        text_corpus_path=args.text_corpus,
-        manifest_path=args.manifest,
-        output_dir=args.output_dir,
+        train_parquet=output_dir / "train.parquet",
+        vision_corpus_path=output_dir / "vision_corpus.jsonl",
+        text_corpus_path=output_dir / "text_corpus.jsonl",
+        manifest_path=output_dir / "build_manifest.json",
+        output_dir=output_dir,
         teacher=teacher,
         config=SFTBuilderConfig(
-            sample_fraction=args.sample_fraction,
-            validation_fraction=args.validation_fraction,
-            seed=args.seed,
-            oracle_top_k=args.oracle_top_k,
-            max_tool_response_tokens=args.max_tool_response_tokens,
+            sample_fraction=0.05,
+            validation_fraction=0.10,
+            seed=seed,
+            oracle_top_k=3,
+            max_tool_response_tokens=DEFAULT_TOOL_RESPONSE_TOKENS,
         ),
         observation_tokenizer=observation_tokenizer,
+        build_fingerprint=build_fingerprint,
+    )
+    _write_sft_cache_marker(
+        marker_path=cache_marker,
+        output_dir=output_dir,
+        build_fingerprint=build_fingerprint,
+        inputs=inputs,
     )
     print(json.dumps(result.report, ensure_ascii=False, indent=2, sort_keys=True))
 
