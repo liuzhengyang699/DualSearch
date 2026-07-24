@@ -45,6 +45,50 @@ def sha256_file(path: str | Path, chunk_size: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+def artifact_fingerprint(path: str | Path) -> dict[str, Any]:
+    """Fingerprint one file or a complete artifact directory.
+
+    Directory identity includes every relative path, byte size, and file
+    digest in deterministic order.  Builders use this to detect index files
+    changed in place after their cache manifest was published.
+    """
+
+    path = Path(path)
+    if path.is_file():
+        return {
+            "kind": "file",
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
+    if not path.is_dir():
+        raise FileNotFoundError(f"Artifact does not exist: {path}")
+
+    files = sorted(
+        (item for item in path.rglob("*") if item.is_file()),
+        key=lambda item: item.relative_to(path).as_posix(),
+    )
+    if not files:
+        raise ValueError(f"Artifact directory is empty: {path}")
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for item in files:
+        relative = item.relative_to(path).as_posix()
+        size = item.stat().st_size
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(sha256_file(item).encode("ascii"))
+        digest.update(b"\n")
+        total_bytes += size
+    return {
+        "kind": "directory",
+        "files_sha256": digest.hexdigest(),
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+    }
+
+
 def stable_digest(value: Any) -> str:
     return sha256_bytes(canonical_json(value).encode("utf-8"))
 

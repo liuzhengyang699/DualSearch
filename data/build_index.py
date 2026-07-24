@@ -1,5 +1,4 @@
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -17,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dual_search.search.fingerprints import (
+    artifact_fingerprint,
     bge_m3_encoder_config,
     corpus_fingerprint,
     model_fingerprint,
@@ -811,42 +811,6 @@ def _validate_rl_generation(
     }
 
 
-def _artifact_fingerprint(path: Path) -> dict[str, Any]:
-    if path.is_file():
-        return {
-            "kind": "file",
-            "sha256": sha256_file(path),
-            "size": path.stat().st_size,
-        }
-    if not path.is_dir():
-        raise FileNotFoundError(f"Index artifact does not exist: {path}")
-
-    files = sorted(
-        (item for item in path.rglob("*") if item.is_file()),
-        key=lambda item: item.relative_to(path).as_posix(),
-    )
-    if not files:
-        raise ValueError(f"Index artifact directory is empty: {path}")
-    digest = hashlib.sha256()
-    total_bytes = 0
-    for item in files:
-        relative = item.relative_to(path).as_posix()
-        size = item.stat().st_size
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(size).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(sha256_file(item).encode("ascii"))
-        digest.update(b"\n")
-        total_bytes += size
-    return {
-        "kind": "directory",
-        "files_sha256": digest.hexdigest(),
-        "file_count": len(files),
-        "total_bytes": total_bytes,
-    }
-
-
 def _reuse_status(
     cache_manifest_path: Path,
     *,
@@ -882,7 +846,7 @@ def _reuse_status(
         if not isinstance(expected, Mapping):
             return False, f"index cache output {name!r} has no fingerprint"
         try:
-            actual = _artifact_fingerprint(path)
+            actual = artifact_fingerprint(path)
         except (OSError, ValueError) as exc:
             return False, str(exc)
         if stable_digest(dict(expected)) != stable_digest(actual):
@@ -1091,7 +1055,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "outputs": {
                 name: {
                     "path": str(output_paths[name]),
-                    "fingerprint": _artifact_fingerprint(path),
+                    "fingerprint": artifact_fingerprint(path),
                 }
                 for name, path in staged_outputs.items()
             },

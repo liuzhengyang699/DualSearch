@@ -21,6 +21,13 @@ from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
+from dual_search.protocol import (
+    ProtocolError,
+    canonical_json,
+    get_tool_schemas,
+    parse_assistant_action,
+    validate_tool_call_payload,
+)
 from verl.utils.chat_template import apply_chat_template
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -32,7 +39,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DUAL_SEARCH_SFT_DATA_SOURCE = "dual_search_sft"
-DUAL_SEARCH_SFT_SCHEMA_VERSION = 2
+DUAL_SEARCH_SFT_SCHEMA_VERSION = 3
+DUAL_SEARCH_SFT_ROLES = ("user", "assistant", "tool", "assistant", "tool", "assistant")
+DUAL_SEARCH_COARSE_TAXA = {"Plants", "Insects", "Birds"}
+_THINK_ONLY_RE = re.compile(r"\s*<think>(.*?)</think>\s*\Z", re.DOTALL)
 
 
 def _integer_value(value: Any) -> int | None:
@@ -59,12 +69,20 @@ def _validate_dual_search_sft_schema(
     dual_search_mask = dataframe["data_source"] == DUAL_SEARCH_SFT_DATA_SOURCE
     if not bool(dual_search_mask.any()):
         return
+    if "schema_version" in dataframe.columns:
+        for index, value in dataframe.loc[dual_search_mask, "schema_version"].items():
+            if _integer_value(value) == 2:
+                raise ValueError(
+                    "Legacy DualSearch SFT schema v2 is no longer supported "
+                    f"(invalid row index: {index}). Rerun the sft stage to produce schema v3."
+                )
     required_columns = {
         "schema_version",
         "sample_id",
         "parent_sample_id",
         "source_image_index",
         "image_key",
+        "coarse_taxon",
         image_column,
         messages_column,
         tools_column,
@@ -72,20 +90,25 @@ def _validate_dual_search_sft_schema(
     missing_columns = sorted(required_columns.difference(dataframe.columns))
     if missing_columns:
         raise ValueError(
-            "Legacy DualSearch SFT data is incompatible with schema v2; "
+            "DualSearch SFT data is incompatible with schema v3; "
             f"missing columns {missing_columns}. Rerun the sft stage."
         )
 
     for index, row in dataframe.loc[dual_search_mask].iterrows():
-        if _integer_value(row["schema_version"]) != DUAL_SEARCH_SFT_SCHEMA_VERSION:
+        schema_version = _integer_value(row["schema_version"])
+        if schema_version != DUAL_SEARCH_SFT_SCHEMA_VERSION:
+            if schema_version == 2:
+                detail = "schema v2 is no longer supported"
+            else:
+                detail = f"schema_version must be {DUAL_SEARCH_SFT_SCHEMA_VERSION}"
             raise ValueError(
-                "Legacy DualSearch SFT data is incompatible with schema v2; "
-                f"schema_version must be 2 (invalid row index: {index}). "
-                "Rerun the sft stage."
+                f"Legacy DualSearch SFT data is incompatible with schema v3: {detail} "
+                f"(invalid row index: {index}). Rerun the sft stage."
             )
         sample_id = row["sample_id"]
         parent_sample_id = row["parent_sample_id"]
         image_key = row["image_key"]
+        coarse_taxon = row["coarse_taxon"]
         source_image_index = _integer_value(row["source_image_index"])
         if (
             not isinstance(sample_id, str)
@@ -94,19 +117,21 @@ def _validate_dual_search_sft_schema(
             or not parent_sample_id.strip()
             or not isinstance(image_key, str)
             or not image_key.strip()
+            or not isinstance(coarse_taxon, str)
+            or coarse_taxon not in DUAL_SEARCH_COARSE_TAXA
             or source_image_index is None
             or source_image_index <= 0
         ):
             raise ValueError(
-                f"Malformed DualSearch SFT schema v2 row {index}: sample_id, "
-                "parent_sample_id, image_key, and positive source_image_index are required. "
-                "Rerun the sft stage."
+                f"Malformed DualSearch SFT schema v3 row {index}: sample_id, "
+                "parent_sample_id, image_key, positive source_image_index, and coarse_taxon "
+                "in {Plants, Insects, Birds} are required. Rerun the sft stage."
             )
 
         images = normalize_arrow_value(row[image_column])
         if not isinstance(images, list) or len(images) != 1:
             raise ValueError(
-                f"Malformed DualSearch SFT schema v2 row {index}: exactly one image is required. "
+                f"Malformed DualSearch SFT schema v3 row {index}: exactly one image is required. "
                 "Rerun the sft stage."
             )
         physical_image = images[0]
@@ -114,23 +139,19 @@ def _validate_dual_search_sft_schema(
             physical_image = physical_image.get("image")
         if not isinstance(physical_image, str) or not physical_image.strip():
             raise ValueError(
-                f"Malformed DualSearch SFT schema v2 row {index}: the child image path is empty. "
+                f"Malformed DualSearch SFT schema v3 row {index}: the child image path is empty. "
                 "Rerun the sft stage."
             )
 
         try:
             messages = decode_message_tool_arguments(row[messages_column])
             tools = decode_tools_column(row[tools_column])
+            _validate_dual_search_conversation(messages, tools)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Malformed DualSearch SFT schema v2 row {index}: {exc}. "
+                f"Malformed DualSearch SFT schema v3 row {index}: {exc}. "
                 "Rerun the sft stage."
             ) from exc
-        if not messages or not tools:
-            raise ValueError(
-                f"Malformed DualSearch SFT schema v2 row {index}: messages and tools "
-                "must be non-empty. Rerun the sft stage."
-            )
 
 
 def _is_null(value: Any) -> bool:
@@ -211,6 +232,114 @@ def decode_message_tool_arguments(messages: Any) -> list[dict[str, Any]]:
                 raise ValueError("SFT function.arguments must decode to a JSON object")
             function["arguments"] = arguments
     return messages
+
+
+def _validate_think_only(content: Any, *, label: str) -> None:
+    if not isinstance(content, str):
+        raise ValueError(f"{label} assistant content must be text")
+    match = _THINK_ONLY_RE.fullmatch(content)
+    if match is None or not match.group(1).strip():
+        raise ValueError(f"{label} assistant content must be exactly one non-empty <think> block")
+
+
+def _validate_tool_turn(
+    assistant: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    expected_name: str,
+) -> None:
+    _validate_think_only(assistant.get("content"), label=expected_name)
+    tool_calls = assistant.get("tool_calls")
+    if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+        raise ValueError(f"{expected_name} assistant turn must contain exactly one tool call")
+    tool_call = tool_calls[0]
+    if not isinstance(tool_call, dict) or set(tool_call) != {"type", "function"}:
+        raise ValueError(
+            f"{expected_name} tool call must contain exactly type and function"
+        )
+    if tool_call.get("type") != "function":
+        raise ValueError(f"{expected_name} tool call type must be function")
+    function = tool_call.get("function")
+    if not isinstance(function, dict) or set(function) != {"name", "arguments"}:
+        raise ValueError(
+            f"{expected_name} function must contain exactly name and arguments"
+        )
+    if function.get("name") != expected_name:
+        raise ValueError(
+            f"expected {expected_name} tool call, got {function.get('name')!r}"
+        )
+    try:
+        validate_tool_call_payload(
+            {"name": function["name"], "arguments": function["arguments"]},
+            image_count=1,
+        )
+    except ProtocolError as exc:
+        raise ValueError(f"invalid {expected_name} arguments: {exc}") from exc
+
+    if observation.get("name") != expected_name:
+        raise ValueError(
+            f"{expected_name} observation name must match its tool call"
+        )
+    observation_content = observation.get("content")
+    if not isinstance(observation_content, str) or not observation_content.strip():
+        raise ValueError(f"{expected_name} observation must be non-empty text")
+    if observation.get("tool_calls"):
+        raise ValueError(f"{expected_name} observation cannot contain tool calls")
+
+
+def _validate_dual_search_conversation(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> None:
+    if len(messages) != len(DUAL_SEARCH_SFT_ROLES):
+        raise ValueError(
+            f"messages must contain exactly {len(DUAL_SEARCH_SFT_ROLES)} turns"
+        )
+    roles = tuple(message.get("role") for message in messages)
+    if roles != DUAL_SEARCH_SFT_ROLES:
+        raise ValueError(
+            "message roles must be exactly "
+            "user, assistant, tool, assistant, tool, assistant"
+        )
+    if tools is None or canonical_json(tools) != canonical_json(get_tool_schemas()):
+        raise ValueError("tools must exactly match the shared DualSearch tool schemas")
+
+    user_content = messages[0].get("content")
+    if not isinstance(user_content, str):
+        raise ValueError("the initial user content must be text")
+    if user_content.count("<image>") != 1 or "<video>" in user_content:
+        raise ValueError(
+            "the initial user content must contain exactly one <image> and no <video> placeholder"
+        )
+    for message in messages[1:]:
+        content = message.get("content")
+        if isinstance(content, str) and any(
+            placeholder in content for placeholder in ("<image>", "<video>")
+        ):
+            raise ValueError(
+                "only the initial user turn may contain a media placeholder"
+            )
+
+    _validate_tool_turn(
+        messages[1],
+        messages[2],
+        expected_name="vision_search",
+    )
+    _validate_tool_turn(
+        messages[3],
+        messages[4],
+        expected_name="search",
+    )
+
+    final_message = messages[5]
+    if final_message.get("tool_calls"):
+        raise ValueError("the final assistant turn cannot contain tool calls")
+    final_action = parse_assistant_action(final_message.get("content"), image_count=1)
+    if final_action.kind != "answer":
+        raise ValueError(
+            "the final assistant turn must contain exactly one non-empty think block "
+            f"and one non-empty answer block: {final_action.error or 'invalid final action'}"
+        )
 
 
 def optional_bool(value: Any, *, field: str) -> bool | None:

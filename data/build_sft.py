@@ -1,16 +1,15 @@
-"""Build verified DualSearch cold-start SFT trajectories.
+"""Build verified, closed-loop DualSearch cold-start SFT trajectories.
 
-The builder consumes *already materialized* EVQA train/corpus artifacts.  It
-does not download datasets, build retrieval indexes, or call the real
-retrieval services.  Instead it constructs deterministic oracle observations
-from the held-out-safe corpora and asks an OpenAI-compatible multimodal teacher
-for three small JSON decisions:
+The builder consumes already-materialized RL/corpus/index artifacts.  For each
+eligible single-image example it asks a multimodal teacher for one small JSON
+decision at a time, executes the generated query against the same HTTP
+retrieval services used by the RL agent, and exposes only the real Top-K
+observation to the next stage:
 
-``vision_search -> search -> answer``.
+``vision_search -> search -> gold-conditioned answer``.
 
-Only single-hop, retrieval-resolvable training examples are eligible.  Teacher
-failures are skipped and deterministically supplemented from the same question
-type until that stratum reaches its target or runs out of image groups.
+Only successful, causally consistent trajectories are published.  The builder
+does not download data, build indexes, or start model services.
 """
 
 from __future__ import annotations
@@ -48,6 +47,9 @@ from dual_search.protocol import (
     validate_tool_call_payload,
 )
 from dual_search.search.fingerprints import (
+    artifact_fingerprint,
+    corpus_fingerprint,
+    load_and_validate_index_meta,
     model_fingerprint,
     sha256_file,
     stable_digest,
@@ -58,13 +60,15 @@ RESERVED_TAG_RE = re.compile(
     r"</?(?:think|tool_call|tool_response|answer|search|vision_search)(?:\s[^>]*)?>|<\|im_(?:start|end)\|>",
     re.IGNORECASE,
 )
+MEDIA_PLACEHOLDER_RE = re.compile(r"<(?:image|video)>", re.IGNORECASE)
 WORD_RE = re.compile(r"[^\w]+", re.UNICODE)
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 MULTI_HOP_MARKERS = {"2", "2hop", "twohop", "multihop", "multiplehop"}
 DEFAULT_TOOL_RESPONSE_TOKENS = 500
 DEFAULT_TOOL_WRAPPER_TOKEN_RESERVE = 32
-SFT_SCHEMA_VERSION = 2
+SFT_SCHEMA_VERSION = 3
 RL_INPUT_SCHEMA_VERSION = 2
+ALLOWED_COARSE_TAXA = ("Plants", "Insects", "Birds")
 SFT_PARQUET_COLUMNS = (
     "schema_version",
     "data_source",
@@ -76,42 +80,98 @@ SFT_PARQUET_COLUMNS = (
     "source_image_index",
     "image_key",
     "category_key",
+    "coarse_taxon",
     "question_type",
     "retrieval_resolvable",
     "extra_info",
 )
 
+VISION_SYSTEM_PROMPT = """Generate a visual retrieval query for the given image and question.
 
-VISION_STAGE_SCHEMA: dict[str, Any] = {
+Write:
+- "think": a concise explanation of which visible characteristics are useful for retrieval.
+- "query": a concise English retrieval query grounded in the visible image.
+
+Do not answer the question.
+Do not guess an entity or species name unless it already appears in the question.
+Do not use hidden labels or external knowledge.
+Focus on discriminative visual properties rather than writing a generic query such as "identify this image".
+
+Return exactly one JSON object:
+{"think":"...","query":"..."}
+
+Do not output Markdown, XML tags, or any other text."""
+
+SEARCH_SYSTEM_PROMPT = """Generate a text knowledge-base query using the original question and the real visual retrieval result.
+
+Write:
+- "think": a concise explanation of what textual information is needed.
+- "query": a standalone English search query targeting that information.
+
+Use entity names only when they appear in the question or visual retrieval result.
+Target the property requested by the question, such as habitat, diet, distribution, behavior, taxonomy, or morphology.
+Do not answer the question.
+Do not use a reference answer or hidden evidence label.
+
+Return exactly one JSON object:
+{"think":"...","query":"..."}
+
+Do not output Markdown, XML tags, or any other text."""
+
+ANSWER_SYSTEM_PROMPT = """Generate a concise final reasoning summary and answer using the provided question, real retrieval results, and reference answer.
+
+Write:
+- "think": a short explanation connecting the visual identification, textual evidence, and answer.
+- "answer": the final answer.
+
+Every factual statement in "think" must be supported by the question or retrieval results.
+Do not introduce unsupported facts.
+Do not mention that a reference answer was provided.
+Do not describe the data-generation process.
+
+Return exactly one JSON object:
+{"think":"...","answer":"..."}
+
+Do not output Markdown, XML tags, or any other text."""
+
+VISION_USER_REQUEST = (
+    "Generate the visual reasoning and retrieval query for the attached image."
+)
+SEARCH_USER_REQUEST = (
+    "Based on the previous visual retrieval trajectory, generate the text "
+    "reasoning and a standalone text search query needed to answer the question."
+)
+ANSWER_USER_REQUEST = (
+    "Generate a concise reasoning summary grounded in the previous trajectory "
+    "and the reference answer.\n"
+    "Also generate a final answer. The generated answer will be canonicalized "
+    "separately."
+)
+NO_PREVIOUS_TOOL_INTERACTION = "No previous tool interaction."
+TEACHER_USER_TEXT_TEMPLATE = (
+    "[QUESTION]\n{question}\n\n"
+    "[CONTENT]\n{content}\n\n"
+    "[USER REQUEST]\n{request}"
+)
+TEACHER_TOOL_HISTORY_TEMPLATE = (
+    "<think>{think}</think>\n"
+    "<tool_call>\n{tool_call}</tool_call>\n"
+    "<tool_response>\n{observation}\n</tool_response>"
+)
+REFERENCE_ANSWER_TEMPLATE = "Reference answer:\n{answer}"
+
+QUERY_STAGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "think": {"type": "string", "minLength": 1},
-        "vision_search": {
-            "type": "object",
-            "properties": {"query": {"type": "string", "minLength": 1}},
-            "required": ["query"],
-            "additionalProperties": False,
-        },
+        "query": {"type": "string", "minLength": 1},
     },
-    "required": ["think", "vision_search"],
+    "required": ["think", "query"],
     "additionalProperties": False,
 }
 
-SEARCH_STAGE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "think": {"type": "string", "minLength": 1},
-        "search": {
-            "type": "object",
-            "properties": {"query": {"type": "string", "minLength": 1}},
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    },
-    "required": ["think", "search"],
-    "additionalProperties": False,
-}
-
+VISION_STAGE_SCHEMA = QUERY_STAGE_SCHEMA
+SEARCH_STAGE_SCHEMA = QUERY_STAGE_SCHEMA
 ANSWER_STAGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -135,6 +195,21 @@ class TeacherClient(Protocol):
     ) -> Mapping[str, Any]: ...
 
 
+class RetrieverClient(Protocol):
+    """Small testable interface for runtime-equivalent retrieval."""
+
+    def vision_search(
+        self,
+        *,
+        query: str,
+        image: str,
+        image_index: int,
+        top_k: int,
+    ) -> list[dict[str, Any]]: ...
+
+    def text_search(self, *, query: str, top_k: int) -> list[dict[str, Any]]: ...
+
+
 @dataclass(frozen=True)
 class TeacherConfig:
     base_url: str
@@ -149,10 +224,10 @@ class TeacherConfig:
 
 @dataclass(frozen=True)
 class SFTBuilderConfig:
-    sample_fraction: float = 0.05
+    sample_fraction: float = 0.10
     validation_fraction: float = 0.10
     seed: int = 42
-    oracle_top_k: int = 3
+    retrieval_top_k: int = 3
     data_source: str = "dual_search_sft"
     max_tool_response_tokens: int = DEFAULT_TOOL_RESPONSE_TOKENS
     fallback_wrapper_token_reserve: int = DEFAULT_TOOL_WRAPPER_TOKEN_RESERVE
@@ -162,8 +237,10 @@ class SFTBuilderConfig:
             raise ValueError("sample_fraction must be in (0, 1]")
         if not 0 <= self.validation_fraction < 1:
             raise ValueError("validation_fraction must be in [0, 1)")
-        if self.oracle_top_k < 2:
-            raise ValueError("oracle_top_k must be at least 2")
+        if self.retrieval_top_k <= 0:
+            raise ValueError("retrieval_top_k must be positive")
+        if self.data_source != "dual_search_sft":
+            raise ValueError("data_source is fixed to 'dual_search_sft'")
         if self.max_tool_response_tokens <= 0:
             raise ValueError("max_tool_response_tokens must be positive")
         if not 0 <= self.fallback_wrapper_token_reserve < self.max_tool_response_tokens:
@@ -179,6 +256,10 @@ class SFTBuildResult:
 
 class TeacherRequestError(RuntimeError):
     """Teacher transport error after retrying transient failures."""
+
+
+class RetrievalRequestError(RuntimeError):
+    """Retriever transport or response-contract failure."""
 
 
 class TrajectoryBuildError(ValueError):
@@ -277,6 +358,168 @@ class VLLMTeacherClient:
             return decoded
 
         raise AssertionError("unreachable")
+
+
+@dataclass(frozen=True)
+class HTTPRetrieverConfig:
+    vision_url: str
+    text_url: str
+    timeout_seconds: float = 120.0
+    max_retries: int = 2
+    retry_backoff_seconds: float = 1.0
+
+
+class HTTPRetrieverClient:
+    """Strict client for the same retrieval endpoints used by the agent loop."""
+
+    _TRANSIENT_STATUS = VLLMTeacherClient._TRANSIENT_STATUS
+
+    def __init__(self, config: HTTPRetrieverConfig, session: Any | None = None):
+        self.config = config
+        if session is None:
+            import requests
+
+            session = requests.Session()
+        self.session = session
+
+    def _post(
+        self,
+        *,
+        endpoint: str,
+        payload: Mapping[str, Any],
+        label: str,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        attempts = self.config.max_retries + 1
+        for attempt in range(attempts):
+            try:
+                response = self.session.post(
+                    endpoint,
+                    json=dict(payload),
+                    timeout=self.config.timeout_seconds,
+                )
+            except Exception as exc:
+                if attempt + 1 >= attempts:
+                    raise RetrievalRequestError(f"{label} request failed: {exc}") from exc
+                time.sleep(self.config.retry_backoff_seconds * (2**attempt))
+                continue
+
+            if response.status_code in self._TRANSIENT_STATUS:
+                if attempt + 1 >= attempts:
+                    raise RetrievalRequestError(
+                        f"{label} returned transient HTTP {response.status_code} "
+                        f"after {attempts} attempts"
+                    )
+                time.sleep(self.config.retry_backoff_seconds * (2**attempt))
+                continue
+            try:
+                response.raise_for_status()
+            except Exception as exc:
+                raise RetrievalRequestError(
+                    f"{label} returned HTTP {response.status_code}"
+                ) from exc
+
+            try:
+                body = response.json()
+                batches = body["result"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RetrievalRequestError(
+                    f"{label} response must contain a result list"
+                ) from exc
+            if (
+                not isinstance(batches, list)
+                or len(batches) != 1
+                or not isinstance(batches[0], list)
+            ):
+                raise RetrievalRequestError(
+                    f"{label} response must contain exactly one result batch"
+                )
+            raw_results = batches[0]
+            if len(raw_results) != top_k:
+                raise RetrievalRequestError(
+                    f"{label} returned {len(raw_results)} results; expected Top-{top_k}"
+                )
+
+            normalized: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for rank, raw_item in enumerate(raw_results, start=1):
+                if not isinstance(raw_item, Mapping):
+                    raise RetrievalRequestError(
+                        f"{label} result at rank {rank} is not an object"
+                    )
+                if set(raw_item) != {"document", "score"}:
+                    raise RetrievalRequestError(
+                        f"{label} result at rank {rank} must contain exactly "
+                        "document and score"
+                    )
+                document = raw_item.get("document")
+                score = raw_item.get("score")
+                if not isinstance(document, Mapping):
+                    raise RetrievalRequestError(
+                        f"{label} result at rank {rank} has no document object"
+                    )
+                if (
+                    isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or not math.isfinite(float(score))
+                ):
+                    raise RetrievalRequestError(
+                        f"{label} result at rank {rank} has an invalid score"
+                    )
+                document = dict(_plain(document))
+                document_id = _document_id(document)
+                if not document_id:
+                    raise RetrievalRequestError(
+                        f"{label} result at rank {rank} has no stable document id"
+                    )
+                if document_id in seen_ids:
+                    raise RetrievalRequestError(
+                        f"{label} returned duplicate document id {document_id!r}"
+                    )
+                seen_ids.add(document_id)
+                normalized.append({"document": document, "score": float(score)})
+            return normalized
+
+        raise AssertionError("unreachable")
+
+    def vision_search(
+        self,
+        *,
+        query: str,
+        image: str,
+        image_index: int,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        payload = {
+            "queries": [
+                {
+                    "query": query,
+                    "image_index": image_index,
+                    "image": _image_as_data_url(image),
+                }
+            ],
+            "topk": top_k,
+            "return_scores": True,
+        }
+        return self._post(
+            endpoint=self.config.vision_url,
+            payload=payload,
+            label="vision retriever",
+            top_k=top_k,
+        )
+
+    def text_search(self, *, query: str, top_k: int) -> list[dict[str, Any]]:
+        payload = {
+            "queries": [query],
+            "topk": top_k,
+            "return_scores": True,
+        }
+        return self._post(
+            endpoint=self.config.text_url,
+            payload=payload,
+            label="text retriever",
+            top_k=top_k,
+        )
 
 
 def _stable_key(seed: int, *parts: Any) -> str:
@@ -412,8 +655,8 @@ def _referenced_page_identities(record: Mapping[str, Any]) -> set[str]:
 def is_multi_hop_record(record: Mapping[str, Any]) -> bool:
     """Recognize multi-hop rows across EVQA schema variants.
 
-    ``question_type`` remains untouched and is still used as the sampling
-    stratum.  This predicate only controls SFT eligibility.
+    This predicate only controls SFT eligibility; accepted records are later
+    sampled independently within each coarse taxon.
     """
 
     if _is_explicit_multi_hop(_lookup(record, "question_type", "")):
@@ -650,9 +893,7 @@ def truncate_tool_observation(
 def _teacher_messages(
     *,
     stage: str,
-    sample_id: str,
     question: str,
-    answers: Sequence[str],
     image_path: str,
     vision_observation: str | None = None,
     text_observation: str | None = None,
@@ -660,141 +901,125 @@ def _teacher_messages(
     vision_query: str | None = None,
     search_think: str | None = None,
     search_query: str | None = None,
+    canonical_gold_answer: str | None = None,
 ) -> list[dict[str, Any]]:
-    common = (
-        "Return exactly one JSON object matching the supplied response schema. The official answer is planning "
-        "context, not permission to reveal it early. Before the final stage, do not copy an answer or hidden "
-        "entity name unless it already appears in the question or an observation. Do not emit XML/protocol tags."
-    )
-    context = {
-        "sample_id": sample_id,
-        "stage": stage,
-        "question": question,
-    }
-    if vision_observation is not None:
-        context["vision_observation"] = vision_observation
-    if text_observation is not None:
-        context["text_observation"] = text_observation
-
     if stage == "vision":
-        instruction = (
-            "Describe concise reasoning and a visual retrieval hint. The query should use visible attributes and "
-            "the information need, without naming an unrevealed target entity or answer."
-        )
+        system_prompt = VISION_SYSTEM_PROMPT
+        history = NO_PREVIOUS_TOOL_INTERACTION
+        request = VISION_USER_REQUEST
     elif stage == "search":
-        instruction = (
-            "Using the visual observation, produce concise reasoning and a standalone text knowledge-base query."
-        )
-    elif stage == "answer":
-        instruction = "Using both observations, produce concise reasoning and the final answer."
-    else:
-        raise ValueError(f"unknown teacher stage: {stage}")
-
-    # Every stage is a separate HTTP request, so include the actual query image
-    # each time rather than relying on server-side conversational state.
-    initial_user_content: list[dict[str, Any]] = [
-        {"type": "image_url", "image_url": {"url": _image_as_data_url(image_path)}},
-        {
-            "type": "text",
-            "text": (
-                f"Question: {question}\nOfficial answers for planning only: "
-                f"{json.dumps(list(answers), ensure_ascii=False)}"
-            ),
-        },
-    ]
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": common},
-        {"role": "user", "content": initial_user_content},
-    ]
-
-    def append_tool_history(
-        *,
-        think: str,
-        name: str,
-        arguments: Mapping[str, Any],
-        observation: str,
-    ) -> None:
-        tool_call_id = f"dual_search_{name}"
-        messages.append(
-            {
-                "role": "assistant",
-                "content": f"<think>{think}</think>",
-                "tool_calls": [
-                    {
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": canonical_json(arguments)},
-                    }
-                ],
-            }
-        )
-        messages.append(
-            {
-                "role": "tool",
-                "name": name,
-                "tool_call_id": tool_call_id,
-                "content": observation,
-            }
-        )
-
-    if stage in {"search", "answer"}:
         if not all((vision_think, vision_query, vision_observation)):
-            raise ValueError("search/answer teacher stages require complete vision tool history")
-        append_tool_history(
+            raise ValueError("search stage requires complete visual tool history")
+        system_prompt = SEARCH_SYSTEM_PROMPT
+        history = _teacher_tool_history(
             think=str(vision_think),
             name="vision_search",
             arguments={"image_index": 1, "query": str(vision_query)},
             observation=str(vision_observation),
         )
-    if stage == "answer":
-        if not all((search_think, search_query, text_observation)):
-            raise ValueError("answer teacher stage requires complete text tool history")
-        append_tool_history(
-            think=str(search_think),
-            name="search",
-            arguments={"query": str(search_query)},
-            observation=str(text_observation),
+        request = SEARCH_USER_REQUEST
+    elif stage == "answer":
+        if not all(
+            (
+                vision_think,
+                vision_query,
+                vision_observation,
+                search_think,
+                search_query,
+                text_observation,
+                canonical_gold_answer,
+            )
+        ):
+            raise ValueError("answer stage requires complete tool history and reference answer")
+        system_prompt = ANSWER_SYSTEM_PROMPT
+        history = "\n\n".join(
+            [
+                _teacher_tool_history(
+                    think=str(vision_think),
+                    name="vision_search",
+                    arguments={"image_index": 1, "query": str(vision_query)},
+                    observation=str(vision_observation),
+                ),
+                _teacher_tool_history(
+                    think=str(search_think),
+                    name="search",
+                    arguments={"query": str(search_query)},
+                    observation=str(text_observation),
+                ),
+                REFERENCE_ANSWER_TEMPLATE.format(answer=canonical_gold_answer),
+            ]
         )
-
-    stage_request = [
-        {
-            "type": "text",
-            "text": f"{instruction}\nContext:\n{json.dumps(context, ensure_ascii=False, indent=2)}",
-        }
-    ]
-    if stage == "vision":
-        # Keep the first stage as one natural multimodal user turn. Later
-        # stages need a new user turn after their structured tool history.
-        initial_user_content.extend(stage_request)
+        request = ANSWER_USER_REQUEST
     else:
-        messages.append({"role": "user", "content": stage_request})
-    return messages
+        raise ValueError(f"unknown teacher stage: {stage}")
+
+    prompt_text = TEACHER_USER_TEXT_TEMPLATE.format(
+        question=question,
+        content=history,
+        request=request,
+    )
+    # Each stage is an independent teacher request, so attach the actual image
+    # every time. The flattened CONTENT is synthesis-only and is never written
+    # into the student's structured SFT conversation.
+    return [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": _image_as_data_url(image_path)}},
+                {"type": "text", "text": prompt_text},
+            ],
+        },
+    ]
+
+
+def _teacher_tool_history(
+    *,
+    think: str,
+    name: str,
+    arguments: Mapping[str, Any],
+    observation: str,
+) -> str:
+    payload = canonical_json({"name": name, "arguments": dict(arguments)})
+    return TEACHER_TOOL_HISTORY_TEMPLATE.format(
+        think=think,
+        tool_call=payload,
+        observation=observation,
+    )
 
 
 def _strict_stage_output(stage: str, value: Mapping[str, Any]) -> tuple[str, str]:
     expected = {
-        "vision": ({"think", "vision_search"}, "vision_search"),
-        "search": ({"think", "search"}, "search"),
+        "vision": ({"think", "query"}, "query"),
+        "search": ({"think", "query"}, "query"),
         "answer": ({"think", "answer"}, "answer"),
     }
     keys, payload_key = expected[stage]
     if not isinstance(value, Mapping) or set(value) != keys:
         raise TrajectoryBuildError(stage, f"teacher JSON keys must be exactly {sorted(keys)}")
     think = value.get("think")
-    payload = value.get(payload_key)
-    if stage in {"vision", "search"}:
-        if not isinstance(payload, Mapping) or set(payload) != {"query"}:
-            raise TrajectoryBuildError(stage, f"{payload_key} must contain exactly query")
-        output = payload.get("query")
-    else:
-        output = payload
+    output = value.get(payload_key)
     if not isinstance(think, str) or not think.strip():
         raise TrajectoryBuildError(stage, "think must be a non-empty string")
     if not isinstance(output, str) or not output.strip():
         raise TrajectoryBuildError(stage, f"{payload_key} must be a non-empty string")
-    if RESERVED_TAG_RE.search(think) or RESERVED_TAG_RE.search(output):
-        raise TrajectoryBuildError(stage, "teacher output contains a reserved protocol tag")
+    if (
+        RESERVED_TAG_RE.search(think)
+        or RESERVED_TAG_RE.search(output)
+        or MEDIA_PLACEHOLDER_RE.search(think)
+        or MEDIA_PLACEHOLDER_RE.search(output)
+    ):
+        raise TrajectoryBuildError(stage, "teacher output contains a reserved control tag")
     return think.strip(), output.strip()
+
+
+def _sanitize_media_placeholders(content: str) -> str:
+    """Prevent retrieved prose from becoming multimodal loader controls."""
+
+    return MEDIA_PLACEHOLDER_RE.sub(
+        lambda match: match.group(0).replace("<", "&lt;").replace(">", "&gt;"),
+        content,
+    )
 
 
 def _normalized_phrase(value: Any) -> str:
@@ -837,148 +1062,6 @@ def _document_id(document: Mapping[str, Any]) -> str:
     return str(document.get("id") or document.get("image_key") or document.get("section_id") or "").strip()
 
 
-def _deterministic_pick(
-    candidates: Sequence[Mapping[str, Any]],
-    count: int,
-    *,
-    seed: int,
-    sample_id: str,
-    purpose: str,
-) -> list[dict[str, Any]]:
-    ordered = sorted(
-        (_plain(candidate) for candidate in candidates),
-        key=lambda item: (_stable_key(seed, sample_id, purpose, _document_id(item)), _document_id(item)),
-    )
-    return [dict(item) for item in ordered[:count]]
-
-
-def _oracle_vision_documents(
-    record: Mapping[str, Any],
-    vision_corpus: Sequence[Mapping[str, Any]],
-    *,
-    config: SFTBuilderConfig,
-) -> list[dict[str, Any]]:
-    sample_id = str(_lookup(record, "sample_id", "")).strip()
-    category_key = str(_lookup(record, "category_key", "")).strip()
-    image_key = str(_lookup(record, "image_key", "")).strip()
-    positives = [
-        doc
-        for doc in vision_corpus
-        if str(doc.get("category_key", "")) == category_key and str(doc.get("image_key", "")) != image_key
-    ]
-    negatives = [doc for doc in vision_corpus if str(doc.get("category_key", "")) != category_key]
-    if not positives:
-        raise TrajectoryBuildError("oracle_vision", "no non-heldout positive visual candidate")
-    negative_count = config.oracle_top_k - 1
-    if len(negatives) < negative_count:
-        raise TrajectoryBuildError("oracle_vision", f"need {negative_count} visual distractors")
-    selected = _deterministic_pick(
-        positives, 1, seed=config.seed, sample_id=sample_id, purpose="vision_positive"
-    ) + _deterministic_pick(
-        negatives,
-        negative_count,
-        seed=config.seed,
-        sample_id=sample_id,
-        purpose="vision_distractor",
-    )
-    return sorted(selected, key=lambda doc: _stable_key(config.seed, sample_id, "vision_position", _document_id(doc)))
-
-
-def _text_match_score(record: Mapping[str, Any], document: Mapping[str, Any]) -> int:
-    section_ids = {str(value).strip() for value in _as_list(_lookup(record, "evidence_section_id", []))}
-    urls = {_normalize_url(value) for value in _as_list(_lookup(record, "wikipedia_url", []))}
-    titles = {str(value).strip().casefold() for value in _as_list(_lookup(record, "wikipedia_title", []))}
-    evidence = str(_lookup(record, "evidence", "")).strip().casefold()
-    doc_ids = {
-        str(document.get("id", "")).strip(),
-        str(document.get("section_id", "")).strip(),
-    }
-    score = 0
-    if section_ids and any(value and value in section_ids for value in doc_ids):
-        score += 16
-    if urls and _normalize_url(document.get("url")) in urls:
-        score += 8
-    if titles and str(document.get("title", "")).strip().casefold() in titles:
-        score += 4
-    if evidence and evidence in str(document.get("contents", "")).casefold():
-        score += 2
-    return score
-
-
-def _is_exact_text_evidence(record: Mapping[str, Any], document: Mapping[str, Any]) -> bool:
-    """Require the configured evidence section, not merely the same page.
-
-    A URL/title match is useful for ranking, but accepting it on its own when
-    an evidence-section ID or evidence text is available can create a falsely
-    supervised Oracle trace. The RL data's ``text_resolvable`` flag already
-    promises that the exact evidence exists; this is the corresponding hard
-    assertion at SFT construction time.
-    """
-
-    section_ids = {
-        str(value).strip()
-        for value in _as_list(_lookup(record, "evidence_section_id", []))
-        if str(value).strip()
-    }
-    document_ids = {
-        str(document.get("id", "")).strip(),
-        str(document.get("section_id", "")).strip(),
-    }
-    if section_ids:
-        return any(value in section_ids for value in document_ids if value)
-
-    evidence = str(_lookup(record, "evidence", "")).strip().casefold()
-    if evidence:
-        return evidence in str(document.get("contents", "")).casefold()
-
-    urls = {_normalize_url(value) for value in _as_list(_lookup(record, "wikipedia_url", []))}
-    if any(urls):
-        return _normalize_url(document.get("url")) in urls
-    titles = {
-        str(value).strip().casefold()
-        for value in _as_list(_lookup(record, "wikipedia_title", []))
-        if str(value).strip()
-    }
-    return bool(titles and str(document.get("title", "")).strip().casefold() in titles)
-
-
-def _oracle_text_documents(
-    record: Mapping[str, Any],
-    text_corpus: Sequence[Mapping[str, Any]],
-    *,
-    config: SFTBuilderConfig,
-) -> list[dict[str, Any]]:
-    sample_id = str(_lookup(record, "sample_id", "")).strip()
-    positives = [doc for doc in text_corpus if _is_exact_text_evidence(record, doc)]
-    if not positives:
-        raise TrajectoryBuildError("oracle_text", "no matching evidence section in text corpus")
-    positive = sorted(
-        positives,
-        key=lambda doc: (
-            -_text_match_score(record, doc),
-            _stable_key(config.seed, sample_id, "text_positive", _document_id(doc)),
-        ),
-    )[0]
-    positive_id = _document_id(positive)
-    positive_url = _normalize_url(positive.get("url"))
-    negatives = [
-        doc
-        for doc in text_corpus
-        if _document_id(doc) != positive_id and _normalize_url(doc.get("url")) != positive_url
-    ]
-    negative_count = config.oracle_top_k - 1
-    if len(negatives) < negative_count:
-        raise TrajectoryBuildError("oracle_text", f"need {negative_count} text distractors")
-    selected = [dict(_plain(positive))] + _deterministic_pick(
-        negatives,
-        negative_count,
-        seed=config.seed,
-        sample_id=sample_id,
-        purpose="text_distractor",
-    )
-    return sorted(selected, key=lambda doc: _stable_key(config.seed, sample_id, "text_position", _document_id(doc)))
-
-
 def _entity_aliases(record: Mapping[str, Any], positive_vision_doc: Mapping[str, Any]) -> list[str]:
     values: list[Any] = []
     for key in ("entity_aliases", "category_title", "wikipedia_title"):
@@ -998,6 +1081,172 @@ def _entity_aliases(record: Mapping[str, Any], positive_vision_doc: Mapping[str,
             seen.add(normalized)
             aliases.append(text)
     return aliases
+
+
+def _corpus_table(
+    corpus: Sequence[Mapping[str, Any]],
+    *,
+    label: str,
+) -> dict[str, dict[str, Any]]:
+    table: dict[str, dict[str, Any]] = {}
+    for row_number, raw_document in enumerate(corpus, start=1):
+        document = dict(_plain(raw_document))
+        document_id = _document_id(document)
+        if not document_id:
+            raise ValueError(f"{label} corpus row {row_number} has no stable id")
+        if document_id in table:
+            raise ValueError(f"{label} corpus contains duplicate id {document_id!r}")
+        table[document_id] = document
+    return table
+
+
+def _validate_retrieved_documents(
+    results: Sequence[Mapping[str, Any]],
+    *,
+    corpus_by_id: Mapping[str, Mapping[str, Any]],
+    label: str,
+    expected_count: int,
+) -> list[dict[str, Any]]:
+    if len(results) != expected_count:
+        raise TrajectoryBuildError(
+            label,
+            f"retriever returned {len(results)} results; expected Top-{expected_count}",
+        )
+    validated: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for rank, raw_result in enumerate(results, start=1):
+        result = dict(_plain(raw_result))
+        document = result.get("document")
+        score = result.get("score")
+        if not isinstance(document, Mapping):
+            raise TrajectoryBuildError(label, f"retrieval result {rank} has no document")
+        document = dict(document)
+        document_id = _document_id(document)
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+        ):
+            raise TrajectoryBuildError(
+                label,
+                f"retrieval result {document_id or rank!r} has an invalid score",
+            )
+        expected = corpus_by_id.get(document_id)
+        if expected is None:
+            raise TrajectoryBuildError(
+                label,
+                f"retrieval result {document_id!r} is absent from the published corpus",
+            )
+        if document_id in seen_ids:
+            raise TrajectoryBuildError(
+                label,
+                f"retriever returned duplicate document id {document_id!r}",
+            )
+        seen_ids.add(document_id)
+        if stable_digest(document) != stable_digest(dict(expected)):
+            raise TrajectoryBuildError(
+                label,
+                f"retrieval result {document_id!r} differs from the published corpus",
+            )
+        validated.append({"document": document, "score": float(score)})
+    return validated
+
+
+def _target_evidence_pairs(record: Mapping[str, Any]) -> set[tuple[str, str]]:
+    raw_pairs = [
+        pair
+        for pair in _as_list(_lookup(record, "wiki_pairs", []))
+        if isinstance(pair, Mapping)
+    ]
+    urls = [
+        _normalize_url(pair.get("normalized_url") or pair.get("url"))
+        for pair in raw_pairs
+    ]
+    urls = [url for url in urls if url]
+    if not urls:
+        urls = [
+            _normalize_url(value)
+            for value in _as_list(_lookup(record, "wikipedia_url", []))
+            if _normalize_url(value)
+        ]
+    section_ids = [
+        str(value).strip()
+        for value in _as_list(_lookup(record, "evidence_section_id", []))
+        if str(value).strip()
+    ]
+    if len(urls) != 1 or not section_ids:
+        raise TrajectoryBuildError(
+            "preflight",
+            "single-hop SFT requires one Wikipedia URL and at least one evidence section id",
+        )
+    return {(urls[0], section_id) for section_id in section_ids}
+
+
+def _document_evidence_pair(document: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        _normalize_url(document.get("url") or document.get("source_url")),
+        str(document.get("section_id", "")).strip(),
+    )
+
+
+def _visible_vision_marker(document: Mapping[str, Any], rank: int) -> str:
+    contents = str(document.get("contents", ""))
+    title = contents.split("\n", 1)[0].strip().strip('"')
+    if not title:
+        title = str(document.get("title", "")).strip()
+    # Keep this marker aligned with ``format_vision_results`` in
+    # ``dual_search.protocol``.  Checking the formatted marker, rather than a
+    # hidden document id, proves that the positive result remains visible to
+    # the model after the runtime-equivalent observation truncation.
+    return f"Caption {rank}(Title: {title})"
+
+
+def _visible_text_marker(document: Mapping[str, Any], rank: int) -> str:
+    contents = str(document.get("contents", ""))
+    title = contents.split("\n", 1)[0].strip().strip('"')
+    if not title:
+        title = str(document.get("title", "")).strip()
+    return f"Doc {rank}(Title: {title})"
+
+
+def _visible_text_segments(
+    results: Sequence[Mapping[str, Any]],
+    observation: str,
+) -> dict[int, str]:
+    """Return normalized visible text belonging to each non-truncated result."""
+
+    normalized_observation = _normalized_phrase(observation)
+    markers = {
+        rank: _normalized_phrase(_visible_text_marker(result["document"], rank))
+        for rank, result in enumerate(results, start=1)
+    }
+    positions = {
+        rank: normalized_observation.find(marker)
+        for rank, marker in markers.items()
+    }
+    segments: dict[int, str] = {}
+    for rank, start in positions.items():
+        if start < 0:
+            continue
+        later_starts = [
+            position
+            for later_rank, position in positions.items()
+            if later_rank > rank and position > start
+        ]
+        end = min(later_starts) if later_starts else len(normalized_observation)
+        segments[rank] = normalized_observation[start:end]
+    return segments
+
+
+def _evidence_phrases(record: Mapping[str, Any]) -> list[str]:
+    return [
+        phrase
+        for phrase in (
+            str(value).strip()
+            for value in _as_list(_lookup(record, "evidence", []))
+        )
+        if phrase
+    ]
 
 
 def _assistant_tool_message(*, think: str, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -1021,9 +1270,10 @@ def _assistant_tool_message(*, think: str, name: str, arguments: Mapping[str, An
 
 def _build_trajectory(
     record: Mapping[str, Any],
-    vision_corpus: Sequence[Mapping[str, Any]],
-    text_corpus: Sequence[Mapping[str, Any]],
+    vision_corpus_by_id: Mapping[str, Mapping[str, Any]],
+    text_corpus_by_id: Mapping[str, Mapping[str, Any]],
     teacher: TeacherClient,
+    retriever: RetrieverClient,
     config: SFTBuilderConfig,
     observation_tokenizer: Any | None = None,
 ) -> dict[str, Any]:
@@ -1031,40 +1281,33 @@ def _build_trajectory(
     image_key = str(_lookup(record, "image_key", "")).strip()
     question = str(_lookup(record, "question", "")).strip()
     question_type = str(_lookup(record, "question_type", "")).strip()
+    coarse_taxon = str(_lookup(record, "coarse_taxon", "")).strip()
     image_path = _first_image_path(record)
     answers = _gold_answers(record)
-    if not all((sample_id, image_key, question, question_type, image_path)) or not answers:
+    if (
+        not all((sample_id, image_key, question, question_type, coarse_taxon, image_path))
+        or not answers
+    ):
         raise TrajectoryBuildError("preflight", "sample is missing required SFT fields")
-
-    vision_documents = _oracle_vision_documents(record, vision_corpus, config=config)
-    text_documents = _oracle_text_documents(record, text_corpus, config=config)
-    vision_result_text = format_vision_results([{"document": doc} for doc in vision_documents])
-    vision_observation = truncate_tool_observation(
-        f"image_index=1:\n{vision_result_text}".rstrip(),
-        tokenizer=observation_tokenizer,
-        max_tokens=config.max_tool_response_tokens,
-        fallback_wrapper_token_reserve=config.fallback_wrapper_token_reserve,
-    )
-    text_observation = truncate_tool_observation(
-        format_text_results([{"document": doc} for doc in text_documents]),
-        tokenizer=observation_tokenizer,
-        max_tokens=config.max_tool_response_tokens,
-        fallback_wrapper_token_reserve=config.fallback_wrapper_token_reserve,
-    )
-    category_key = str(_lookup(record, "category_key", ""))
-    positive_vision_document = next(
-        document for document in vision_documents if str(document.get("category_key", "")) == category_key
-    )
-    protected = [*answers, *_entity_aliases(record, positive_vision_document)]
+    canonical_gold_answer = answers[0]
+    if RESERVED_TAG_RE.search(question) or MEDIA_PLACEHOLDER_RE.search(question):
+        raise TrajectoryBuildError("preflight", "question contains a reserved control tag")
+    if RESERVED_TAG_RE.search(canonical_gold_answer) or MEDIA_PLACEHOLDER_RE.search(
+        canonical_gold_answer
+    ):
+        raise TrajectoryBuildError("preflight", "canonical answer contains a reserved control tag")
+    category_key = str(_lookup(record, "category_key", "")).strip()
+    target_evidence_pairs = _target_evidence_pairs(record)
+    evidence_phrases = _evidence_phrases(record)
+    if not evidence_phrases:
+        raise TrajectoryBuildError("preflight", "sample has no evidence text for visibility validation")
 
     try:
         vision_raw = teacher.generate(
             stage="vision",
             messages=_teacher_messages(
                 stage="vision",
-                sample_id=sample_id,
                 question=question,
-                answers=answers,
                 image_path=image_path,
             ),
             response_schema=VISION_STAGE_SCHEMA,
@@ -1085,18 +1328,75 @@ def _build_trajectory(
     _check_early_leak(
         stage="vision",
         generated=[vision_think, vision_query],
+        protected_phrases=[
+            *answers,
+            *_as_list(_lookup(record, "wikipedia_title", [])),
+        ],
+        visible_context=question,
+    )
+
+    try:
+        vision_results = retriever.vision_search(
+            query=vision_query,
+            image=image_path,
+            image_index=1,
+            top_k=config.retrieval_top_k,
+        )
+    except RetrievalRequestError as exc:
+        raise TrajectoryBuildError("vision_retrieval", str(exc)) from exc
+    vision_results = _validate_retrieved_documents(
+        vision_results,
+        corpus_by_id=vision_corpus_by_id,
+        label="vision_retrieval",
+        expected_count=config.retrieval_top_k,
+    )
+    vision_positive_ranks = [
+        rank
+        for rank, result in enumerate(vision_results, start=1)
+        if str(result["document"].get("category_key", "")).strip() == category_key
+        and str(result["document"].get("image_key", "")).strip() != image_key
+    ]
+    if not vision_positive_ranks:
+        raise TrajectoryBuildError("vision_hit", "real visual Top-K missed category_key")
+    positive_vision_document = vision_results[vision_positive_ranks[0] - 1]["document"]
+    protected = [*answers, *_entity_aliases(record, positive_vision_document)]
+    _check_early_leak(
+        stage="vision",
+        generated=[vision_think, vision_query],
         protected_phrases=protected,
         visible_context=question,
     )
+    vision_observation = truncate_tool_observation(
+        _sanitize_media_placeholders(
+            (
+                "image_index=1:\n"
+                + format_vision_results(vision_results)
+            ).rstrip()
+        ),
+        tokenizer=observation_tokenizer,
+        max_tokens=config.max_tool_response_tokens,
+        fallback_wrapper_token_reserve=config.fallback_wrapper_token_reserve,
+    )
+    visible_vision_ranks = [
+        rank
+        for rank in vision_positive_ranks
+        if _normalized_phrase(
+            _visible_vision_marker(vision_results[rank - 1]["document"], rank)
+        )
+        in _normalized_phrase(vision_observation)
+    ]
+    if not visible_vision_ranks:
+        raise TrajectoryBuildError(
+            "vision_observation",
+            "positive visual result was removed by observation truncation",
+        )
 
     try:
         search_raw = teacher.generate(
             stage="search",
             messages=_teacher_messages(
                 stage="search",
-                sample_id=sample_id,
                 question=question,
-                answers=answers,
                 image_path=image_path,
                 vision_observation=vision_observation,
                 vision_think=vision_think,
@@ -1121,13 +1421,80 @@ def _build_trajectory(
     )
 
     try:
+        text_results = retriever.text_search(
+            query=search_query,
+            top_k=config.retrieval_top_k,
+        )
+    except RetrievalRequestError as exc:
+        raise TrajectoryBuildError("text_retrieval", str(exc)) from exc
+    text_results = _validate_retrieved_documents(
+        text_results,
+        corpus_by_id=text_corpus_by_id,
+        label="text_retrieval",
+        expected_count=config.retrieval_top_k,
+    )
+    returned_pairs: dict[tuple[str, str], int] = {}
+    for rank, result in enumerate(text_results, start=1):
+        returned_pairs.setdefault(_document_evidence_pair(result["document"]), rank)
+    missing_pairs = target_evidence_pairs.difference(returned_pairs)
+    if missing_pairs:
+        raise TrajectoryBuildError(
+            "text_hit",
+            f"real text Top-K missed evidence sections {sorted(missing_pairs)!r}",
+        )
+    text_observation = truncate_tool_observation(
+        _sanitize_media_placeholders(format_text_results(text_results)),
+        tokenizer=observation_tokenizer,
+        max_tokens=config.max_tool_response_tokens,
+        fallback_wrapper_token_reserve=config.fallback_wrapper_token_reserve,
+    )
+    target_ranks = {
+        returned_pairs[target_pair]
+        for target_pair in target_evidence_pairs
+    }
+    visible_text_segments = _visible_text_segments(text_results, text_observation)
+    invisible_target_ranks = sorted(target_ranks.difference(visible_text_segments))
+    if invisible_target_ranks:
+        raise TrajectoryBuildError(
+            "text_observation",
+            f"target evidence documents were removed by observation truncation: "
+            f"ranks {invisible_target_ranks}",
+        )
+    evidence_source_ranks: dict[str, list[int]] = {}
+    for phrase in evidence_phrases:
+        normalized_phrase = _normalized_phrase(phrase)
+        ranks = [
+            rank
+            for rank in sorted(target_ranks)
+            if normalized_phrase
+            in _normalized_phrase(text_results[rank - 1]["document"].get("contents", ""))
+        ]
+        if not ranks:
+            raise TrajectoryBuildError(
+                "text_hit",
+                "annotated evidence is absent from the retrieved target section",
+            )
+        evidence_source_ranks[phrase] = ranks
+    invisible_evidence = [
+        phrase
+        for phrase in evidence_phrases
+        if not any(
+            _normalized_phrase(phrase) in visible_text_segments[rank]
+            for rank in evidence_source_ranks[phrase]
+        )
+    ]
+    if invisible_evidence:
+        raise TrajectoryBuildError(
+            "text_observation",
+            "target evidence was removed by observation truncation",
+        )
+
+    try:
         answer_raw = teacher.generate(
             stage="answer",
             messages=_teacher_messages(
                 stage="answer",
-                sample_id=sample_id,
                 question=question,
-                answers=answers,
                 image_path=image_path,
                 vision_observation=vision_observation,
                 text_observation=text_observation,
@@ -1135,13 +1502,15 @@ def _build_trajectory(
                 vision_query=vision_query,
                 search_think=search_think,
                 search_query=search_query,
+                canonical_gold_answer=canonical_gold_answer,
             ),
             response_schema=ANSWER_STAGE_SCHEMA,
         )
     except TeacherRequestError as exc:
         raise TrajectoryBuildError("answer", "teacher transport failure") from exc
-    answer_think, final_answer = _strict_stage_output("answer", answer_raw)
-    # Deliberately no semantic/correctness comparison against the gold answer.
+    answer_think, _teacher_answer = _strict_stage_output("answer", answer_raw)
+    # Deliberately ignore the Teacher answer. This stage is gold-conditioned,
+    # and the published answer is always the canonical official target.
 
     messages = [
         {"role": "user", "content": _student_prompt(record, question)},
@@ -1153,8 +1522,16 @@ def _build_trajectory(
         {"role": "tool", "name": "vision_search", "content": vision_observation},
         _assistant_tool_message(think=search_think, name="search", arguments={"query": search_query}),
         {"role": "tool", "name": "search", "content": text_observation},
-        {"role": "assistant", "content": f"<think>{answer_think}</think>\n<answer>{final_answer}</answer>"},
+        {
+            "role": "assistant",
+            "content": (
+                f"<think>{answer_think}</think>\n"
+                f"<answer>{canonical_gold_answer}</answer>"
+            ),
+        },
     ]
+    vision_ids = [_document_id(result["document"]) for result in vision_results]
+    text_ids = [_document_id(result["document"]) for result in text_results]
     return {
         "schema_version": SFT_SCHEMA_VERSION,
         "data_source": config.data_source,
@@ -1165,7 +1542,8 @@ def _build_trajectory(
         "parent_sample_id": str(_lookup(record, "parent_sample_id", "")).strip(),
         "source_image_index": int(_lookup(record, "source_image_index", 0)),
         "image_key": image_key,
-        "category_key": str(_lookup(record, "category_key", "")),
+        "category_key": category_key,
+        "coarse_taxon": coarse_taxon,
         "question_type": question_type,
         "retrieval_resolvable": True,
         "extra_info": {
@@ -1173,10 +1551,30 @@ def _build_trajectory(
             "parent_sample_id": str(_lookup(record, "parent_sample_id", "")).strip(),
             "source_image_index": int(_lookup(record, "source_image_index", 0)),
             "image_key": image_key,
+            "category_key": category_key,
+            "coarse_taxon": coarse_taxon,
             "question_type": question_type,
             "source_data_source": record.get("data_source"),
-            "oracle_vision_ids": [_document_id(doc) for doc in vision_documents],
-            "oracle_text_ids": [_document_id(doc) for doc in text_documents],
+            "observation_source": "real_retriever",
+            "retrieval_top_k": config.retrieval_top_k,
+            "retrieved_vision_ids": vision_ids,
+            "retrieved_vision_scores": [result["score"] for result in vision_results],
+            "vision_positive_ranks": vision_positive_ranks,
+            "vision_visible_positive_ranks": visible_vision_ranks,
+            "retrieved_text_ids": text_ids,
+            "retrieved_text_scores": [result["score"] for result in text_results],
+            # A fixed-shape list avoids turning every URL into a distinct
+            # sparse Arrow struct field across the dataset.
+            "text_evidence_ranks": [
+                {
+                    "url": url,
+                    "section_id": section_id,
+                    "rank": returned_pairs[(url, section_id)],
+                }
+                for url, section_id in sorted(target_evidence_pairs)
+            ],
+            "final_generation_mode": "gold_conditioned",
+            "canonical_gold_answer": canonical_gold_answer,
         },
     }
 
@@ -1190,8 +1588,8 @@ _QUERY_IMAGE_KEYS = {
     "source_split",
 }
 _LEGACY_REBUILD_MESSAGE = (
-    "RL training data schema v1 is incompatible with single-image SFT expansion; "
-    "rerun split, corpus, and sft to produce schema v2 artifacts"
+    "RL training data schema v1 is incompatible with closed-loop SFT v3; "
+    "rerun data/build_rl.py before data/build_sft.py"
 )
 
 
@@ -1347,32 +1745,40 @@ def _single_image_child(
 
 def _eligible_records(
     records: Sequence[Mapping[str, Any]],
-) -> tuple[list[dict[str, Any]], Counter[str], int, Counter[str]]:
+) -> tuple[list[dict[str, Any]], Counter[str], Counter[str]]:
     eligible: list[dict[str, Any]] = []
     excluded: Counter[str] = Counter()
-    eligible_parent_count = 0
-    eligible_parents_by_type: Counter[str] = Counter()
+    eligible_by_taxon: Counter[str] = Counter()
     for raw_record in records:
         record = dict(_plain(raw_record))
         query_images = _validated_query_images(record)
         if is_multi_hop_record(record):
             excluded["two_hop"] += 1
             continue
+        question_type = str(_lookup(record, "question_type", "")).strip()
+        if question_type != "automatic":
+            excluded["non_automatic"] += 1
+            continue
+        if len(query_images) != 1:
+            excluded["not_single_image"] += 1
+            continue
         if _lookup(record, "retrieval_resolvable", False) is not True:
             excluded["retrieval_unresolvable"] += 1
             continue
-        eligible_parent_count += 1
-        question_type = str(_lookup(record, "question_type", ""))
-        eligible_parents_by_type[question_type] += 1
-        eligible.extend(_single_image_child(record, image) for image in query_images)
-    return eligible, excluded, eligible_parent_count, eligible_parents_by_type
+        coarse_taxon = str(_lookup(record, "coarse_taxon", "")).strip()
+        if coarse_taxon not in ALLOWED_COARSE_TAXA:
+            excluded["unsupported_coarse_taxon"] += 1
+            continue
+        eligible.append(_single_image_child(record, query_images[0]))
+        eligible_by_taxon[coarse_taxon] += 1
+    return eligible, excluded, eligible_by_taxon
 
 
 def _sample_targets(records: Sequence[Mapping[str, Any]], fraction: float) -> dict[str, int]:
-    counts = Counter(str(_lookup(record, "question_type", "")) for record in records)
+    counts = Counter(str(_lookup(record, "coarse_taxon", "")) for record in records)
     return {
-        question_type: min(count, max(1, int(math.ceil(count * fraction))))
-        for question_type, count in sorted(counts.items())
+        coarse_taxon: min(count, max(1, int(math.ceil(count * fraction))))
+        for coarse_taxon, count in sorted(counts.items())
     }
 
 
@@ -1412,10 +1818,10 @@ def _connected_train_val_split(
     if len(groups) < 2:
         return list(rows), []
 
-    by_type = Counter(str(row["question_type"]) for row in rows)
+    by_taxon = Counter(str(row["coarse_taxon"]) for row in rows)
     desired = {
-        question_type: max(1, int(round(count * validation_fraction)))
-        for question_type, count in by_type.items()
+        coarse_taxon: max(1, int(round(count * validation_fraction)))
+        for coarse_taxon, count in by_taxon.items()
     }
     val_keys: set[int] = set()
     current: Counter[str] = Counter()
@@ -1436,7 +1842,7 @@ def _connected_train_val_split(
         for component_key in candidates:
             if component_key in val_keys:
                 continue
-            contribution = Counter(str(row["question_type"]) for row in groups[component_key])
+            contribution = Counter(str(row["coarse_taxon"]) for row in groups[component_key])
             gain = sum(min(contribution[key], max(0, desired[key] - current[key])) for key in desired)
             if gain <= 0:
                 continue
@@ -1451,7 +1857,7 @@ def _connected_train_val_split(
         if best_key is None:
             break
         val_keys.add(best_key)
-        current.update(str(row["question_type"]) for row in groups[best_key])
+        current.update(str(row["coarse_taxon"]) for row in groups[best_key])
 
     val_sample_ids = {
         str(row["sample_id"])
@@ -1471,25 +1877,28 @@ def build_sft_records(
     text_corpus: Sequence[Mapping[str, Any]],
     heldout_image_keys: set[str],
     teacher: TeacherClient,
+    retriever: RetrieverClient,
     config: SFTBuilderConfig | None = None,
     observation_tokenizer: Any | None = None,
 ) -> SFTBuildResult:
     """Build SFT rows without performing file I/O.
 
-    This is the primary test seam: fixtures can pass a fake teacher and tiny
-    in-memory corpora without a model, retrieval server, or real EVQA data.
+    This is the primary test seam: fixtures can pass fake teacher/retriever
+    clients and tiny in-memory corpora without real models or EVQA data.
     """
 
     config = config or SFTBuilderConfig()
     vision_corpus = [dict(_plain(row)) for row in vision_corpus]
     text_corpus = [dict(_plain(row)) for row in text_corpus]
+    vision_corpus_by_id = _corpus_table(vision_corpus, label="vision")
+    text_corpus_by_id = _corpus_table(text_corpus, label="text")
     leaked = sorted(
         {str(row.get("image_key", "")) for row in vision_corpus if str(row.get("image_key", "")) in heldout_image_keys}
     )
     if leaked:
         raise ValueError(f"vision corpus contains held-out query images: {leaked[:5]}")
 
-    eligible, excluded, eligible_parent_count, eligible_parents_by_type = _eligible_records(train_records)
+    eligible, excluded, eligible_by_taxon = _eligible_records(train_records)
     missing_heldout = sorted(
         {
             str(_lookup(record, "image_key", ""))
@@ -1503,51 +1912,49 @@ def build_sft_records(
             f"rerun split, corpus, and sft: {missing_heldout[:5]}"
         )
     targets = _sample_targets(eligible, config.sample_fraction)
-    by_type: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    by_taxon: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in eligible:
-        by_type[str(_lookup(record, "question_type", ""))][str(_lookup(record, "image_key", ""))].append(record)
+        by_taxon[str(_lookup(record, "coarse_taxon", ""))].append(record)
 
     successes: list[dict[str, Any]] = []
     success_counts: Counter[str] = Counter()
     attempted_counts: Counter[str] = Counter()
     failure_reasons: Counter[str] = Counter()
-    failures_by_type: dict[str, Counter[str]] = defaultdict(Counter)
+    failures_by_taxon: dict[str, Counter[str]] = defaultdict(Counter)
     failures_by_stage: Counter[str] = Counter()
 
-    for question_type in sorted(by_type):
-        image_groups = by_type[question_type]
-        ordered_group_keys = sorted(
-            image_groups,
-            key=lambda key: _stable_key(config.seed, "sft_candidate_group", question_type, key),
+    for coarse_taxon in ALLOWED_COARSE_TAXA:
+        candidates = sorted(
+            by_taxon.get(coarse_taxon, []),
+            key=lambda record: _stable_key(
+                config.seed,
+                "sft_candidate",
+                coarse_taxon,
+                _lookup(record, "sample_id", ""),
+            ),
         )
-        for image_key in ordered_group_keys:
-            if success_counts[question_type] >= targets[question_type]:
+        for record in candidates:
+            if success_counts[coarse_taxon] >= targets.get(coarse_taxon, 0):
                 break
-            group_records = sorted(
-                image_groups[image_key],
-                key=lambda record: _stable_key(config.seed, "sft_candidate", _lookup(record, "sample_id", "")),
-            )
-            # Selecting an image group is atomic: attempt every row in it even
-            # if an earlier row reaches the approximate per-type target.
-            for record in group_records:
-                attempted_counts[question_type] += 1
-                try:
-                    trajectory = _build_trajectory(
-                        record,
-                        vision_corpus,
-                        text_corpus,
-                        teacher,
-                        config,
-                        observation_tokenizer=observation_tokenizer,
-                    )
-                except TrajectoryBuildError as exc:
-                    key = f"{exc.stage}:{exc.reason}"
-                    failure_reasons[key] += 1
-                    failures_by_type[question_type][key] += 1
-                    failures_by_stage[exc.stage] += 1
-                    continue
-                successes.append(trajectory)
-                success_counts[question_type] += 1
+            attempted_counts[coarse_taxon] += 1
+            try:
+                trajectory = _build_trajectory(
+                    record,
+                    vision_corpus_by_id,
+                    text_corpus_by_id,
+                    teacher,
+                    retriever,
+                    config,
+                    observation_tokenizer=observation_tokenizer,
+                )
+            except TrajectoryBuildError as exc:
+                key = f"{exc.stage}:{exc.reason}"
+                failure_reasons[key] += 1
+                failures_by_taxon[coarse_taxon][key] += 1
+                failures_by_stage[exc.stage] += 1
+                continue
+            successes.append(trajectory)
+            success_counts[coarse_taxon] += 1
 
     train_rows, val_rows = _connected_train_val_split(
         successes, config.validation_fraction, config.seed
@@ -1561,6 +1968,27 @@ def build_sft_records(
     if train_parent_ids & val_parent_ids:
         raise AssertionError("SFT train/validation parent question groups overlap")
 
+    retrieval_report: dict[str, Any] = {
+        "mode": (
+            "real_http"
+            if isinstance(retriever, HTTPRetrieverClient)
+            else "injected_client"
+        ),
+        "top_k": config.retrieval_top_k,
+        "response_documents_verified_against_local_corpus": True,
+        "service_index_identity_verified": False,
+        "positive_must_survive_observation_truncation": True,
+    }
+    if isinstance(retriever, HTTPRetrieverClient):
+        retrieval_report.update(
+            {
+                "vision_url": retriever.config.vision_url,
+                "text_url": retriever.config.text_url,
+                "timeout_seconds": retriever.config.timeout_seconds,
+                "max_retries": retriever.config.max_retries,
+            }
+        )
+
     report = {
         "schema_version": SFT_SCHEMA_VERSION,
         "config": asdict(config),
@@ -1573,28 +2001,36 @@ def build_sft_records(
         },
         "eligibility": {
             "eligible": len(eligible),
-            "eligible_parent_samples": eligible_parent_count,
-            "expanded_single_image_candidates": len(eligible),
+            "eligible_parent_samples": len(eligible),
+            "single_image_candidates": len(eligible),
             "excluded": dict(sorted(excluded.items())),
-            "eligible_by_question_type": dict(
-                sorted(Counter(str(_lookup(row, "question_type", "")) for row in eligible).items())
-            ),
-            "eligible_parents_by_question_type": dict(sorted(eligible_parents_by_type.items())),
+            "eligible_by_coarse_taxon": {
+                taxon: eligible_by_taxon.get(taxon, 0)
+                for taxon in ALLOWED_COARSE_TAXA
+            },
         },
         "sampling": {
-            "targets_by_question_type": targets,
-            "attempted_by_question_type": dict(sorted(attempted_counts.items())),
-            "successful_by_question_type": dict(sorted(success_counts.items())),
-            "target_shortfall_by_question_type": {
+            "targets_by_coarse_taxon": {
+                taxon: targets.get(taxon, 0) for taxon in ALLOWED_COARSE_TAXA
+            },
+            "attempted_by_coarse_taxon": {
+                taxon: attempted_counts.get(taxon, 0) for taxon in ALLOWED_COARSE_TAXA
+            },
+            "successful_by_coarse_taxon": {
+                taxon: success_counts.get(taxon, 0) for taxon in ALLOWED_COARSE_TAXA
+            },
+            "target_shortfall_by_coarse_taxon": {
                 key: max(0, targets[key] - success_counts[key]) for key in sorted(targets)
             },
+            "cross_taxon_backfill": 0,
         },
         "failures": {
             "total": sum(failure_reasons.values()),
             "by_reason": dict(sorted(failure_reasons.items())),
             "by_stage": dict(sorted(failures_by_stage.items())),
-            "by_question_type": {
-                key: dict(sorted(counter.items())) for key, counter in sorted(failures_by_type.items())
+            "by_coarse_taxon": {
+                key: dict(sorted(counter.items()))
+                for key, counter in sorted(failures_by_taxon.items())
             },
         },
         "output": {
@@ -1607,7 +2043,14 @@ def build_sft_records(
             "sft_val_parent_groups": len(val_parent_ids),
             "image_group_overlap": 0,
             "parent_group_overlap": 0,
+            "sft_train_by_coarse_taxon": dict(
+                sorted(Counter(row["coarse_taxon"] for row in train_rows).items())
+            ),
+            "sft_val_by_coarse_taxon": dict(
+                sorted(Counter(row["coarse_taxon"] for row in val_rows).items())
+            ),
         },
+        "retrieval": retrieval_report,
         "observation_truncation": {
             "max_tokens_including_native_wrapper": config.max_tool_response_tokens,
             "mode": "tokenizer_exact" if observation_tokenizer is not None else "conservative_utf8",
@@ -1780,6 +2223,17 @@ def _validate_rl_artifact_generation(
     vision_path: Path,
     text_path: Path,
 ) -> None:
+    if (
+        _schema_version(manifest.get("schema_version")) != RL_INPUT_SCHEMA_VERSION
+        or manifest.get("stage") != "fixed_11k_rl"
+        or manifest.get("status") != "complete"
+        or not isinstance(manifest.get("build_fingerprint"), str)
+        or not str(manifest.get("build_fingerprint")).strip()
+    ):
+        raise ValueError(
+            "build_manifest.json is not a completed fixed-11K RL generation; "
+            "rerun data/build_rl.py."
+        )
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, Mapping):
         raise ValueError(
@@ -1813,6 +2267,7 @@ def build_sft_files(
     manifest_path: str | Path,
     output_dir: str | Path,
     teacher: TeacherClient,
+    retriever: RetrieverClient,
     config: SFTBuilderConfig | None = None,
     observation_tokenizer: Any | None = None,
     build_fingerprint: str | None = None,
@@ -1856,6 +2311,7 @@ def build_sft_files(
         text_corpus,
         heldout_keys,
         teacher,
+        retriever,
         config=config,
         observation_tokenizer=observation_tokenizer,
     )
@@ -1895,12 +2351,19 @@ _SFT_CONFIG_KEYS = {
     "observation_tokenizer_path",
     "timeout",
     "retries",
+    "vision_retriever_url",
+    "text_retriever_url",
+    "retriever_timeout",
+    "retriever_retries",
 }
 _FIXED_SFT_FIELDS = {
-    "sample_fraction": 0.05,
+    "sample_fraction": 0.10,
     "validation_fraction": 0.10,
-    "oracle_top_k": 3,
+    "retrieval_top_k": 3,
     "max_tool_response_tokens": DEFAULT_TOOL_RESPONSE_TOKENS,
+    "coarse_taxa": list(ALLOWED_COARSE_TAXA),
+    "question_type": "automatic",
+    "image_count": 1,
 }
 _SFT_CACHE_MARKER = "sft_build_manifest.json"
 _SFT_OUTPUT_NAMES = (
@@ -1941,7 +2404,7 @@ def _standalone_config(config_path: str | Path) -> tuple[Path, int, dict[str, An
             f"{name}={_FIXED_SFT_FIELDS[name]!r}" for name in forbidden
         )
         raise ValueError(
-            "SFT sampling/oracle/truncation policy is fixed and cannot be "
+            "SFT sampling/retrieval/truncation policy is fixed and cannot be "
             f"overridden in config: {fixed}."
         )
     unknown = sorted(set(raw_sft).difference(_SFT_CONFIG_KEYS))
@@ -1953,6 +2416,8 @@ def _standalone_config(config_path: str | Path) -> tuple[Path, int, dict[str, An
         "teacher_base_url",
         "teacher_model",
         "observation_tokenizer_path",
+        "vision_retriever_url",
+        "text_retriever_url",
     ):
         if not str(sft.get(required) or "").strip():
             raise ValueError(f"sft.{required} must be a non-empty string.")
@@ -1987,6 +2452,29 @@ def _standalone_config(config_path: str | Path) -> tuple[Path, int, dict[str, An
         raise ValueError("sft.retries must be a non-negative integer.")
     sft["timeout"] = timeout
     sft["retries"] = retries
+    retriever_timeout = sft.get("retriever_timeout", 120.0)
+    if isinstance(retriever_timeout, bool):
+        raise ValueError("sft.retriever_timeout must be positive.")
+    try:
+        retriever_timeout = float(retriever_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sft.retriever_timeout must be positive.") from exc
+    if not math.isfinite(retriever_timeout) or retriever_timeout <= 0:
+        raise ValueError("sft.retriever_timeout must be positive.")
+    retriever_retries = sft.get("retriever_retries", 2)
+    if (
+        isinstance(retriever_retries, bool)
+        or not isinstance(retriever_retries, int)
+        or retriever_retries < 0
+    ):
+        raise ValueError("sft.retriever_retries must be a non-negative integer.")
+    for field in ("vision_retriever_url", "text_retriever_url"):
+        url = str(sft[field]).strip()
+        if not url.startswith(("http://", "https://")):
+            raise ValueError(f"sft.{field} must be an HTTP(S) URL.")
+        sft[field] = url
+    sft["retriever_timeout"] = retriever_timeout
+    sft["retriever_retries"] = retriever_retries
     return output_dir, raw_seed, sft
 
 
@@ -2056,6 +2544,200 @@ def _query_pixel_fingerprint(train_path: Path) -> dict[str, Any]:
     return {"count": len(ordered), "sha256": stable_digest(ordered)}
 
 
+def _resolved_artifact_path(value: Any, *, base_dir: Path) -> Path:
+    text = os.path.expandvars(os.path.expanduser(str(value or "").strip()))
+    if not text:
+        raise ValueError("index generation contains an empty artifact path")
+    path = Path(text)
+    return (path if path.is_absolute() else base_dir / path).resolve()
+
+
+def _validate_index_generation(
+    *,
+    output_dir: Path,
+    rl_manifest: Mapping[str, Any],
+    vision_corpus_path: Path,
+    text_corpus_path: Path,
+    index_report: Mapping[str, Any],
+    index_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove that the local indexes still belong to the current RL corpora."""
+
+    for label, value in (
+        ("index_report.json", index_report),
+        ("index_build_manifest.json", index_manifest),
+    ):
+        if (
+            _schema_version(value.get("schema_version")) != 2
+            or value.get("stage") != "index"
+            or value.get("status") != "complete"
+        ):
+            raise ValueError(
+                f"{label} is not a completed index generation; "
+                "rerun data/build_index.py."
+            )
+
+    build_fingerprint = index_report.get("build_fingerprint")
+    if (
+        not isinstance(build_fingerprint, str)
+        or not build_fingerprint
+        or index_manifest.get("build_fingerprint") != build_fingerprint
+    ):
+        raise ValueError(
+            "index report and cache manifest have different build fingerprints; "
+            "rerun data/build_index.py."
+        )
+    cached_inputs = index_manifest.get("inputs")
+    if (
+        not isinstance(cached_inputs, Mapping)
+        or _schema_version(cached_inputs.get("schema_version")) != 2
+        or cached_inputs.get("builder") != "dual_search_indexes"
+        or stable_digest(dict(cached_inputs)) != build_fingerprint
+    ):
+        raise ValueError(
+            "index cache input fingerprint is missing or corrupt; "
+            "rerun data/build_index.py."
+        )
+
+    report_rl_generation = index_report.get("rl_generation")
+    cached_rl_generation = cached_inputs.get("rl_generation")
+    if (
+        not isinstance(report_rl_generation, Mapping)
+        or not isinstance(cached_rl_generation, Mapping)
+        or stable_digest(dict(report_rl_generation))
+        != stable_digest(dict(cached_rl_generation))
+    ):
+        raise ValueError(
+            "index report and cache manifest reference different RL generations; "
+            "rerun data/build_index.py."
+        )
+    rl_build_fingerprint = str(rl_manifest.get("build_fingerprint") or "")
+    if (
+        report_rl_generation.get("build_fingerprint") != rl_build_fingerprint
+        or report_rl_generation.get("manifest_sha256")
+        != sha256_file(output_dir / "build_manifest.json")
+    ):
+        raise ValueError(
+            "indexes do not belong to the current RL build manifest; "
+            "rerun data/build_index.py."
+        )
+
+    current_corpus_fingerprints = {
+        "vision": corpus_fingerprint(
+            vision_corpus_path,
+            id_keys=("id", "image_key"),
+        ),
+        "text": corpus_fingerprint(text_corpus_path, id_keys=("id",)),
+    }
+    expected_index_dirs = {
+        "vision": (output_dir / "indexes" / "vision").resolve(),
+        "text": (output_dir / "indexes" / "text").resolve(),
+    }
+    report_tables: dict[str, Mapping[str, Any]] = {}
+    for kind, corpus_path, encoder_key in (
+        ("vision", vision_corpus_path, "vision_encoder_config"),
+        ("text", text_corpus_path, "text_encoder_config"),
+    ):
+        report_table = index_report.get(kind)
+        if not isinstance(report_table, Mapping):
+            raise ValueError(f"index report has no {kind} section")
+        report_tables[kind] = report_table
+        expected_corpus = current_corpus_fingerprints[kind]
+        for source, fingerprint in (
+            ("index report", report_table.get("corpus_fingerprint")),
+            ("index report RL generation", report_rl_generation.get(f"{kind}_corpus")),
+            ("index cache RL generation", cached_rl_generation.get(f"{kind}_corpus")),
+        ):
+            if (
+                not isinstance(fingerprint, Mapping)
+                or stable_digest(dict(fingerprint)) != stable_digest(expected_corpus)
+            ):
+                raise ValueError(
+                    f"{source} has a stale {kind} corpus fingerprint; "
+                    "rerun data/build_index.py."
+                )
+        if _resolved_artifact_path(
+            report_table.get("corpus"),
+            base_dir=output_dir,
+        ) != corpus_path.resolve():
+            raise ValueError(
+                f"index report points at a different {kind} corpus; "
+                "rerun data/build_index.py."
+            )
+        if _resolved_artifact_path(
+            report_table.get("index_dir"),
+            base_dir=output_dir,
+        ) != expected_index_dirs[kind]:
+            raise ValueError(
+                f"index report points at a different {kind} index directory; "
+                "rerun data/build_index.py."
+            )
+        cached_encoder = cached_inputs.get(encoder_key)
+        report_encoder = report_table.get("encoder_config")
+        if (
+            not isinstance(cached_encoder, Mapping)
+            or not isinstance(report_encoder, Mapping)
+            or stable_digest(dict(cached_encoder))
+            != stable_digest(dict(report_encoder))
+        ):
+            raise ValueError(
+                f"index report and cache manifest have different {kind} encoders; "
+                "rerun data/build_index.py."
+            )
+
+    expected_outputs = {
+        "vision": expected_index_dirs["vision"],
+        "text": expected_index_dirs["text"],
+        "report": (output_dir / "index_report.json").resolve(),
+    }
+    recorded_outputs = index_manifest.get("outputs")
+    if not isinstance(recorded_outputs, Mapping):
+        raise ValueError("index cache manifest has no output fingerprints")
+    actual_output_fingerprints: dict[str, dict[str, Any]] = {}
+    for name, path in expected_outputs.items():
+        record = recorded_outputs.get(name)
+        if not isinstance(record, Mapping):
+            raise ValueError(f"index cache manifest is missing output {name!r}")
+        if _resolved_artifact_path(record.get("path"), base_dir=output_dir) != path:
+            raise ValueError(
+                f"index cache output {name!r} points at a different path; "
+                "rerun data/build_index.py."
+            )
+        expected_fingerprint = record.get("fingerprint")
+        actual_fingerprint = artifact_fingerprint(path)
+        if (
+            not isinstance(expected_fingerprint, Mapping)
+            or stable_digest(dict(expected_fingerprint))
+            != stable_digest(actual_fingerprint)
+        ):
+            raise ValueError(
+                f"index output {name!r} was modified after publication; "
+                "rerun data/build_index.py."
+            )
+        actual_output_fingerprints[name] = actual_fingerprint
+
+    load_and_validate_index_meta(
+        expected_index_dirs["vision"] / "vision_index_meta.json",
+        vision_corpus_path,
+        expected_kind="vision",
+        id_keys=("id", "image_key"),
+        expected_encoder_config=report_tables["vision"]["encoder_config"],
+    )
+    load_and_validate_index_meta(
+        expected_index_dirs["text"] / "text_index_meta.json",
+        text_corpus_path,
+        expected_kind="text",
+        id_keys=("id",),
+        expected_encoder_config=report_tables["text"]["encoder_config"],
+    )
+    return {
+        "build_fingerprint": build_fingerprint,
+        "rl_build_fingerprint": rl_build_fingerprint,
+        "corpus_fingerprints": current_corpus_fingerprints,
+        "output_fingerprints": actual_output_fingerprints,
+    }
+
+
 def _sft_build_fingerprint(
     *,
     output_dir: Path,
@@ -2069,11 +2751,22 @@ def _sft_build_fingerprint(
         "vision_corpus.jsonl",
         "text_corpus.jsonl",
         "build_manifest.json",
+        "index_report.json",
     ):
         path = output_dir / name
         if not path.is_file():
             raise FileNotFoundError(f"Required SFT input does not exist: {path}")
         inputs[name] = {"path": str(path), "sha256": sha256_file(path)}
+    index_manifest_path = output_dir / ".build_cache" / "index_build_manifest.json"
+    if not index_manifest_path.is_file():
+        raise FileNotFoundError(
+            "Required SFT input does not exist: "
+            f"{index_manifest_path}. Run data/build_index.py before build_sft.py."
+        )
+    inputs["index_build_manifest.json"] = {
+        "path": str(index_manifest_path),
+        "sha256": sha256_file(index_manifest_path),
+    }
     manifest = _load_json(output_dir / "build_manifest.json")
     if not isinstance(manifest, Mapping):
         raise ValueError("build_manifest.json must be a JSON object.")
@@ -2113,15 +2806,31 @@ def _sft_build_fingerprint(
         "sha256": stable_digest(sorted(heldout_keys)),
     }
     inputs["query_pixels"] = query_pixels
-    teacher_config = {
+    index_report = _load_json(output_dir / "index_report.json")
+    index_manifest = _load_json(index_manifest_path)
+    if not isinstance(index_report, Mapping) or not isinstance(index_manifest, Mapping):
+        raise ValueError("index report and cache manifest must be JSON objects")
+    inputs["index_generation"] = {
+        **_validate_index_generation(
+            output_dir=output_dir,
+            rl_manifest=manifest,
+            vision_corpus_path=output_dir / "vision_corpus.jsonl",
+            text_corpus_path=output_dir / "text_corpus.jsonl",
+            index_report=index_report,
+            index_manifest=index_manifest,
+        ),
+        "report_sha256": inputs["index_report.json"]["sha256"],
+        "manifest_sha256": inputs["index_build_manifest.json"]["sha256"],
+    }
+    execution_config = {
         key: sft.get(key)
         for key in sorted(_SFT_CONFIG_KEYS)
         if key != "teacher_api_key_env"
     }
-    teacher_config["teacher_api_key_env"] = str(
+    execution_config["teacher_api_key_env"] = str(
         sft.get("teacher_api_key_env") or "VLLM_API_KEY"
     )
-    teacher_config["teacher_model_fingerprint"] = model_fingerprint(
+    execution_config["teacher_model_fingerprint"] = model_fingerprint(
         str(sft["teacher_model"])
     )
     tokenizer_fingerprint = (
@@ -2130,11 +2839,41 @@ def _sft_build_fingerprint(
         else {"mode": "unavailable"}
     )
     payload = {
-        "schema_version": 2,
-        "builder": "dual_search_fixed_sft",
+        "schema_version": SFT_SCHEMA_VERSION,
+        "builder": "dual_search_closed_loop_sft_v3",
         "seed": seed,
         "fixed_recipe": _FIXED_SFT_FIELDS,
-        "teacher": teacher_config,
+        "execution": execution_config,
+        "prompts": {
+            "vision_sha256": stable_digest(
+                {
+                    "system": VISION_SYSTEM_PROMPT,
+                    "request": VISION_USER_REQUEST,
+                }
+            ),
+            "search_sha256": stable_digest(
+                {
+                    "system": SEARCH_SYSTEM_PROMPT,
+                    "request": SEARCH_USER_REQUEST,
+                }
+            ),
+            "answer_sha256": stable_digest(
+                {
+                    "system": ANSWER_SYSTEM_PROMPT,
+                    "request": ANSWER_USER_REQUEST,
+                }
+            ),
+            "layout_sha256": stable_digest(
+                {
+                    "user_text": TEACHER_USER_TEXT_TEMPLATE,
+                    "tool_history": TEACHER_TOOL_HISTORY_TEMPLATE,
+                    "empty_history": NO_PREVIOUS_TOOL_INTERACTION,
+                    "reference_answer": REFERENCE_ANSWER_TEMPLATE,
+                }
+            ),
+            "query_schema": QUERY_STAGE_SCHEMA,
+            "answer_schema": ANSWER_STAGE_SCHEMA,
+        },
         "observation_tokenizer": tokenizer_fingerprint,
         "inputs": inputs,
     }
@@ -2155,7 +2894,9 @@ def _sft_cache_reusable(
         if not isinstance(marker, Mapping) or not isinstance(report, Mapping):
             return False
         if (
-            marker.get("build_fingerprint") != build_fingerprint
+            marker.get("schema_version") != SFT_SCHEMA_VERSION
+            or report.get("schema_version") != SFT_SCHEMA_VERSION
+            or marker.get("build_fingerprint") != build_fingerprint
             or report.get("build_fingerprint") != build_fingerprint
         ):
             return False
@@ -2185,7 +2926,7 @@ def _write_sft_cache_marker(
 ) -> None:
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     value = {
-        "schema_version": 2,
+        "schema_version": SFT_SCHEMA_VERSION,
         "stage": "sft",
         "status": "complete",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -2258,6 +2999,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_retries=int(sft["retries"]),
         )
     )
+    retriever = HTTPRetrieverClient(
+        HTTPRetrieverConfig(
+            vision_url=str(sft["vision_retriever_url"]),
+            text_url=str(sft["text_retriever_url"]),
+            timeout_seconds=float(sft["retriever_timeout"]),
+            max_retries=int(sft["retriever_retries"]),
+        )
+    )
     result = build_sft_files(
         train_parquet=output_dir / "train.parquet",
         vision_corpus_path=output_dir / "vision_corpus.jsonl",
@@ -2265,11 +3014,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         manifest_path=output_dir / "build_manifest.json",
         output_dir=output_dir,
         teacher=teacher,
+        retriever=retriever,
         config=SFTBuilderConfig(
-            sample_fraction=0.05,
+            sample_fraction=0.10,
             validation_fraction=0.10,
             seed=seed,
-            oracle_top_k=3,
+            retrieval_top_k=3,
             max_tool_response_tokens=DEFAULT_TOOL_RESPONSE_TOKENS,
         ),
         observation_tokenizer=observation_tokenizer,

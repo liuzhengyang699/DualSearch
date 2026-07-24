@@ -47,7 +47,11 @@
     "teacher_api_key_env": "VLLM_API_KEY",
     "observation_tokenizer_path": "/absolute/local/path/Qwen3-VL-4B-Instruct",
     "timeout": 120,
-    "retries": 2
+    "retries": 2,
+    "vision_retriever_url": "http://127.0.0.1:8001/vision_retrieve",
+    "text_retriever_url": "http://127.0.0.1:8000/retrieve",
+    "retriever_timeout": 120,
+    "retriever_retries": 2
   },
   "indexes": {
     "vision": {
